@@ -1,0 +1,14 @@
+{
+    "fronius_ip": null,
+    "charger_ip": null,
+    "min_surplus_watts": 1400,
+    "update_interval_seconds": 10,
+    "min_amps": 6,
+    "max_amps": 16,
+    "phases": 3,
+    "voltage": 230,
+    "grid_tolerance_watts": 200,
+    "night_start_hour": 21,
+    "night_end_hour": 5,
+    "web_port": 8080
+}

@@ -1,0 +1,10 @@
+services:
+  solar-charger:
+    build: .
+    container_name: solar-charger
+    restart: always
+    network_mode: host
+    volumes:
+      - ./config.json:/app/config.json
+    environment:
+      - TZ=Europe/Berlin
