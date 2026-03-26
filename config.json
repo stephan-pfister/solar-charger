@@ -8,7 +8,7 @@
     "phases": 3,
     "voltage": 230,
     "grid_tolerance_watts": 200,
-    "night_start_hour": 21,
+    "night_start_hour": 21.05,
     "night_end_hour": 5,
     "web_port": 8080,
     "web_password": null,
