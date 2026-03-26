@@ -116,8 +116,8 @@ class GoECharger:
             self.set_phases(phases)
 
         if amps == 0:
-            logger.info("Stopping charging (frc=1)")
-            return self._set_values(frc=1)
+            logger.info("Pausing charging (frc=0, amp=6)")
+            return self._set_values(frc=0, amp=6)
         else:
             frc = 2 if force_on else 0
             logger.info(f"Setting charging: {amps}A, frc={frc}")

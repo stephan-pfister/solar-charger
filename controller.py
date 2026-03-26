@@ -126,11 +126,22 @@ class SurplusController:
         self.min_charge_enabled = bool(enabled)
 
     def _is_night(self):
-        """Check if current time is within night charging window."""
-        hour = datetime.now().hour
-        if self.night_start > self.night_end:
-            return hour >= self.night_start or hour < self.night_end
-        return self.night_start <= hour < self.night_end
+        """Check if current time is within night charging window.
+
+        Supports fractional hours in config, e.g. 21.05 means 21:05 (HH.MM).
+        """
+        now = datetime.now()
+        current = now.hour + now.minute / 60.0
+        # Convert HH.MM format to fractional hours (21.05 -> 21 + 5/60)
+        start_h = int(self.night_start)
+        start_m = (self.night_start - start_h) * 100
+        start = start_h + start_m / 60.0
+        end_h = int(self.night_end)
+        end_m = (self.night_end - end_h) * 100
+        end = end_h + end_m / 60.0
+        if start > end:
+            return current >= start or current < end
+        return start <= current < end
 
     def _check_daily_charge_reset(self):
         """Reset daily charge counter at midnight."""
