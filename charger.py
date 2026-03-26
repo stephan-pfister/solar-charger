@@ -46,22 +46,39 @@ class GoECharger:
             allowed:        Whether charging is allowed
             force_state:    0=neutral, 1=off, 2=on
             phases:         Current phase mode (1 or 2 meaning 1-phase or 3-phase)
+            battery_percent: Battery SoC percentage (None if unavailable)
+            battery_capacity_wh: Battery capacity in Wh (None if unavailable)
         """
-        data = self._get_status(["car", "amp", "nrg", "alw", "frc", "psm"])
+        data = self._get_status(["car", "amp", "nrg", "alw", "frc", "psm", "soc", "dwo"])
         if data is None:
             return None
 
-        # nrg[11] is total power in watts (index 11 in the nrg array)
+        # Fix: calculate charging power from amps, voltage, and phases
+        # nrg array: indices 0-3 are voltages, 4-7 are currents, 8-10 phase powers, 11 total
+        # API v2: nrg[11] is total power in watts (not 0.01kW as previously assumed)
         nrg = data.get("nrg", [0] * 16)
-        charging_power = nrg[11] * 10 if len(nrg) > 11 else 0  # nrg values in 0.01kW
+        amp = data.get("amp", 0)
+        psm = data.get("psm", 2)  # 1=1-phase, 2=3-phase
+        phase_count = 3 if psm == 2 else 1
+
+        # Use nrg[11] directly (watts) if available and non-zero, otherwise calculate
+        if len(nrg) > 11 and nrg[11] is not None and nrg[11] > 0:
+            charging_power = nrg[11]
+        elif data.get("car", 0) == 2:
+            # Fallback: calculate from amps x voltage x phases
+            charging_power = amp * 230 * phase_count
+        else:
+            charging_power = 0
 
         result = {
             "car": data.get("car", 0),
-            "amp": data.get("amp", 0),
+            "amp": amp,
             "charging_power": charging_power,
             "allowed": data.get("alw", False),
             "force_state": data.get("frc", 0),
-            "phases": data.get("psm", 2),  # 1=1-phase, 2=3-phase
+            "phases": psm,
+            "battery_percent": data.get("soc", None),
+            "battery_capacity_wh": data.get("dwo", None),
         }
 
         car_states = {1: "idle", 2: "charging", 3: "waiting", 4: "complete"}
