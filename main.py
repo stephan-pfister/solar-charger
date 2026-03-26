@@ -122,7 +122,7 @@ def main():
 
     # Start web UI
     web_port = config.get("web_port", 8080)
-    start_web_server(controller, port=web_port)
+    start_web_server(controller, config=config, port=web_port)
 
     # Main loop
     logger.info(
