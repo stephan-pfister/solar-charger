@@ -126,22 +126,11 @@ class SurplusController:
         self.min_charge_enabled = bool(enabled)
 
     def _is_night(self):
-        """Check if current time is within night charging window.
-
-        Supports fractional hours in config, e.g. 21.05 means 21:05 (HH.MM).
-        """
-        now = datetime.now()
-        current = now.hour + now.minute / 60.0
-        # Convert HH.MM format to fractional hours (21.05 -> 21 + 5/60)
-        start_h = int(self.night_start)
-        start_m = (self.night_start - start_h) * 100
-        start = start_h + start_m / 60.0
-        end_h = int(self.night_end)
-        end_m = (self.night_end - end_h) * 100
-        end = end_h + end_m / 60.0
-        if start > end:
-            return current >= start or current < end
-        return start <= current < end
+        """Check if current time is within night charging window."""
+        hour = datetime.now().hour
+        if self.night_start > self.night_end:
+            return hour >= self.night_start or hour < self.night_end
+        return self.night_start <= hour < self.night_end
 
     def _check_daily_charge_reset(self):
         """Reset daily charge counter at midnight."""
@@ -197,10 +186,14 @@ class SurplusController:
         return None, 0
 
     def _force_full_speed(self, charger_status, label):
-        """Charge at max amps, 3-phase."""
+        """Charge at max amps, 3-phase. Uses frc=2 to restart from any state."""
         self._stop_count = 0
         current_phases = charger_status["phases"]
         needs_phase_switch = current_phases != 2
+
+        if charger_status["car"] in (3, 4):
+            car_states = {3: "waiting", 4: "complete"}
+            logger.info(f"{label}: restarting from {car_states[charger_status['car']]} via frc=2")
 
         self.charger.set_charging(
             self.max_amps, force_on=True,
@@ -249,20 +242,16 @@ class SurplusController:
             self.last_status = {"action": "idle", "reason": "no_car", "mode": self.mode}
             return self.last_status
 
-        # Car finished charging
-        if charger_status["car"] == 4:
-            self._record_charging(False)
-            self.daily_stats.record_session(False)
-            self.last_status = {"action": "idle", "reason": "car_complete", "mode": self.mode}
-            return self.last_status
+        # Car finished charging -- but don't bail out if we want to restart
+        # (frc=2 can wake the car from "complete" state)
+        car_complete = charger_status["car"] == 4
 
         # Charge time estimate
         estimate = self._estimate_charge_time(charger_status)
 
         # -- Force OFF override --
         if self.mode == MODE_FORCE_OFF:
-            if charger_status["car"] == 2:
-                self.charger.stop_charging()
+            self.charger.stop_charging()  # always send frc=1
             self._record_charging(False)
             self.daily_stats.record_session(False)
             logger.info("Force OFF: charging stopped by override")
@@ -336,13 +325,19 @@ class SurplusController:
         }
 
         if target_amps >= self.min_amps:
-            # Enough surplus -- charge
+            # Enough surplus -- charge (frc=2 forces charger on, even from stopped/complete)
             self._stop_count = 0
             current_phases = charger_status["phases"]
             needs_phase_switch = current_phases != target_phases
 
             phase_power = self.power_3phase if target_phases == 2 else self.power_1phase
             phase_label = "3-phase" if target_phases == 2 else "1-phase"
+
+            if car_complete or charger_status["car"] == 3:
+                logger.info(
+                    f"Restarting charger from state "
+                    f"{'complete' if car_complete else 'waiting'} via frc=2"
+                )
 
             self.charger.set_charging(
                 target_amps, force_on=True,
@@ -366,12 +361,11 @@ class SurplusController:
             self._record_charging(False)
             self.daily_stats.record_session(False)
             if self._stop_count >= self._stop_threshold:
-                if charger_status["car"] == 2:
-                    self.charger.stop_charging()
-                    logger.info(
-                        f"Surplus too low: {surplus:.0f}W "
-                        f"(need {self.min_1phase:.0f}W for 1-phase). Stopping."
-                    )
+                self.charger.stop_charging()  # always send frc=1 to ensure clean stop
+                logger.info(
+                    f"Surplus too low: {surplus:.0f}W "
+                    f"(need {self.min_1phase:.0f}W for 1-phase). Stopped (frc=1)."
+                )
                 status["action"] = "stopped"
             else:
                 logger.info(
