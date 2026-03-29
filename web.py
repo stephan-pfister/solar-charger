@@ -236,16 +236,26 @@ HTML_PAGE = """<!DOCTYPE html>
       <h2>Status</h2>
       <div id="status">Loading...</div>
     </div>
-    <!-- Chart Card -->
+    <!-- Chart Card: 10 min -->
     <div class="card">
-      <h2>History (10 min)</h2>
-      <div class="chart-wrap"><canvas id="chart"></canvas></div>
+      <h2>Last 10 Minutes</h2>
+      <div class="chart-wrap"><canvas id="chart-10m"></canvas></div>
     </div>
     <!-- Daily Stats Row -->
     <div class="daily-stats" id="daily-stats">
       <div class="daily-stat"><div class="val" id="ds-solar">--</div><div class="lbl">Solar kWh</div></div>
       <div class="daily-stat"><div class="val" id="ds-grid">--</div><div class="lbl">Grid kWh</div></div>
       <div class="daily-stat"><div class="val" id="ds-sessions">--</div><div class="lbl">Sessions</div></div>
+    </div>
+    <!-- Chart Card: 4 hours -->
+    <div class="card card-full">
+      <h2>Last 4 Hours</h2>
+      <div class="chart-wrap"><canvas id="chart-4h"></canvas></div>
+    </div>
+    <!-- Chart Card: 24 hours -->
+    <div class="card card-full">
+      <h2>Last 24 Hours</h2>
+      <div class="chart-wrap"><canvas id="chart-24h"></canvas></div>
     </div>
     <!-- Mode Card -->
     <div class="card card-full">
@@ -265,14 +275,21 @@ HTML_PAGE = """<!DOCTYPE html>
       </div>
     </div>
   </div>
+    <!-- Download Log -->
+    <div class="card card-full" style="text-align:center">
+      <a href="/api/log/download" class="mode-btn" style="display:inline-block;text-decoration:none;padding:12px 24px">
+        Download Today's Log (CSV)
+      </a>
+    </div>
   <div class="refresh" id="updated"></div>
 </div>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 <script>
-let chart = null;
-function initChart() {
-  const ctx = document.getElementById('chart').getContext('2d');
-  chart = new Chart(ctx, {
+const charts = {};
+
+function makeChart(canvasId) {
+  const ctx = document.getElementById(canvasId).getContext('2d');
+  return new Chart(ctx, {
     type: 'line',
     data: {
       labels: [],
@@ -289,7 +306,7 @@ function initChart() {
       responsive: true, maintainAspectRatio: false,
       plugins: { legend: { labels: { color: '#64748b', font: { size: 11 } } } },
       scales: {
-        x: { ticks: { color: '#64748b', maxTicksLimit: 6, font: { size: 10 } },
+        x: { ticks: { color: '#64748b', maxTicksLimit: 8, font: { size: 10 } },
              grid: { color: 'rgba(100,116,139,0.1)' } },
         y: { ticks: { color: '#64748b', font: { size: 10 },
              callback: v => v >= 1000 ? (v/1000).toFixed(1)+'kW' : v+'W' },
@@ -298,13 +315,18 @@ function initChart() {
     }
   });
 }
-function updateChart(history) {
+
+function updateChart(chart, history, showSeconds) {
   if (!chart || !history || !history.length) return;
   const labels = history.map(p => {
     const d = new Date(p.time * 1000);
+    if (showSeconds) {
+      return d.getHours().toString().padStart(2,'0') + ':' +
+             d.getMinutes().toString().padStart(2,'0') + ':' +
+             d.getSeconds().toString().padStart(2,'0');
+    }
     return d.getHours().toString().padStart(2,'0') + ':' +
-           d.getMinutes().toString().padStart(2,'0') + ':' +
-           d.getSeconds().toString().padStart(2,'0');
+           d.getMinutes().toString().padStart(2,'0');
   });
   chart.data.labels = labels;
   chart.data.datasets[0].data = history.map(p => Math.round(p.pv_power || 0));
@@ -365,13 +387,17 @@ function refresh() {
       document.getElementById('ds-sessions').textContent = d.daily_stats.sessions;
     }
     // History chart
-    if (d.history) updateChart(d.history);
+    if (d.history_10m) updateChart(charts['10m'], d.history_10m, true);
+    if (d.history_4h)  updateChart(charts['4h'],  d.history_4h,  false);
+    if (d.history_24h) updateChart(charts['24h'], d.history_24h, false);
     // Logout button
     document.getElementById('logout-btn').style.display = d.auth_enabled ? '' : 'none';
     document.getElementById('updated').textContent = 'Updated: ' + new Date().toLocaleTimeString();
   }).catch(e => { if (e !== 'auth') console.error(e); });
 }
-initChart();
+charts['10m'] = makeChart('chart-10m');
+charts['4h']  = makeChart('chart-4h');
+charts['24h'] = makeChart('chart-24h');
 refresh();
 setInterval(refresh, 5000);
 if ('serviceWorker' in navigator) { navigator.serviceWorker.register('/sw.js'); }
@@ -424,7 +450,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/status":
             status = self.controller.last_status.copy() if self.controller.last_status else {}
             status["mode"] = self.controller.mode
-            status["history"] = self.controller.get_history()
+            status["history_10m"] = self.controller.get_history(minutes=10)
+            status["history_4h"] = self.controller.get_history(minutes=240)
+            status["history_24h"] = self.controller.get_history(minutes=1440)
             status["daily_stats"] = self.controller.daily_stats.to_dict()
             status["min_charge_enabled"] = self.controller.min_charge_enabled
             status["auth_enabled"] = bool(_web_password)
@@ -445,6 +473,25 @@ class RequestHandler(BaseHTTPRequestHandler):
             enabled = params.get("enabled", ["0"])[0] == "1"
             self.controller.set_min_charge_enabled(enabled)
             self._respond(200, "application/json", json.dumps({"ok": True, "enabled": enabled}))
+
+        elif parsed.path == "/api/log/download":
+            from datetime import date as _date
+            log_dir = self.controller._log_dir
+            today = _date.today().isoformat()
+            log_path = os.path.join(log_dir, f"solar_{today}.csv")
+            if os.path.exists(log_path):
+                with open(log_path, "r") as f:
+                    csv_data = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/csv")
+                self.send_header("Content-Disposition", f"attachment; filename=solar_{today}.csv")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(csv_data.encode())
+            else:
+                self._respond(404, "application/json",
+                              json.dumps({"error": "No log file for today yet"}))
+
 
         else:
             self._respond(404, "text/plain", "Not found")

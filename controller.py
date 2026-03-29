@@ -18,6 +18,8 @@ Logic:
     Charge at full speed, 3-phase, max amps -- regardless of surplus.
 """
 
+import csv
+import os
 import logging
 import time
 from collections import deque
@@ -30,6 +32,11 @@ MODE_AUTO = "auto"          # surplus + night schedule
 MODE_FORCE_ON = "force_on"  # full speed, ignore surplus
 MODE_FORCE_OFF = "force_off"  # stop charging
 MODE_SURPLUS = "surplus"    # surplus only, no night charging
+nLOG_FIELDS = [
+    "timestamp", "action", "mode", "pv_power", "load_power",
+    "grid_power", "surplus", "charging_power", "set_amps",
+    "set_phases", "car_state", "force_state",
+]
 
 
 class DailyStats:
@@ -102,8 +109,8 @@ class SurplusController:
         self.min_1phase = self.min_amps * self.power_1phase   # 1380W
         self.min_3phase = self.min_amps * self.power_3phase   # 4140W
 
-        # History: last 60 data points (~10 min at 10s interval)
-        self.history = deque(maxlen=60)
+        # History: 24h at 10s interval = 8640 points
+        self.history = deque(maxlen=8640)
 
         # Daily stats
         self.daily_stats = DailyStats()
@@ -111,6 +118,9 @@ class SurplusController:
         # Daily charge tracking (minutes charged today)
         self._charge_seconds_today = 0
         self._last_charge_date = date.today()
+n        # CSV log directory
+        self._log_dir = config.get("log_dir", "logs")
+        os.makedirs(self._log_dir, exist_ok=True)
 
     def set_mode(self, mode):
         """Set charging mode. Returns True if valid."""
@@ -211,8 +221,8 @@ class SurplusController:
             "power": self.max_amps * self.power_3phase,
         }
 
-    def _add_history_point(self, status):
-        """Store a data point for the history chart."""
+    def _add_history_point(self, status, charger_status=None):
+        """Store a data point for the history chart and CSV log."""
         point = {
             "time": time.time(),
             "pv_power": status.get("pv_power", 0),
@@ -220,10 +230,41 @@ class SurplusController:
             "charging_power": status.get("charging_power", 0),
         }
         self.history.append(point)
+        self._log_to_csv(status, charger_status)
 
-    def get_history(self):
-        """Return history data points as a list."""
-        return list(self.history)
+    def _log_to_csv(self, status, charger_status):
+        """Append one row to today's CSV log file."""
+        today = date.today().isoformat()
+        log_path = os.path.join(self._log_dir, f"solar_{today}.csv")
+        file_exists = os.path.exists(log_path)
+        try:
+            with open(log_path, "a", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=LOG_FIELDS)
+                if not file_exists:
+                    writer.writeheader()
+                row = {
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "action": status.get("action", ""),
+                    "mode": status.get("mode", self.mode),
+                    "pv_power": round(status.get("pv_power", 0)),
+                    "load_power": round(status.get("load_power", 0)),
+                    "grid_power": round(status.get("grid_power", 0)),
+                    "surplus": round(status.get("surplus", 0)),
+                    "charging_power": round(status.get("charging_power", 0)),
+                    "set_amps": status.get("set_amps", ""),
+                    "set_phases": status.get("set_phases", ""),
+                    "car_state": charger_status.get("car", "") if charger_status else "",
+                    "force_state": charger_status.get("force_state", "") if charger_status else "",
+                }
+                writer.writerow(row)
+        except OSError as e:
+            logger.warning(f"Could not write log: {e}")
+
+    def get_history(self, minutes=10):
+        """Return history data points for the last N minutes."""
+        cutoff = time.time() - minutes * 60
+        return [p for p in self.history if p["time"] >= cutoff]
+
 
     def update(self):
         """Run one control cycle. Returns a status dict for logging."""
@@ -240,6 +281,7 @@ class SurplusController:
             self._record_charging(False)
             self.daily_stats.record_session(False)
             self.last_status = {"action": "idle", "reason": "no_car", "mode": self.mode}
+            self._add_history_point(self.last_status, charger_status)
             return self.last_status
 
         # Car finished charging -- but don't bail out if we want to restart
@@ -257,6 +299,7 @@ class SurplusController:
             logger.info("Force OFF: charging stopped by override")
             self.last_status = {"action": "force_off", "mode": self.mode,
                                 "charge_estimate": estimate}
+            self._add_history_point(self.last_status, charger_status)
             return self.last_status
 
         # -- Force ON override: full speed regardless of surplus --
@@ -268,6 +311,7 @@ class SurplusController:
             result["charge_estimate"] = estimate
             result["charging_power"] = charger_status["charging_power"]
             self.last_status = result
+            self._add_history_point(self.last_status, charger_status)
             return self.last_status
 
         # -- Night mode (only in auto mode): full speed, 3-phase --
@@ -279,6 +323,7 @@ class SurplusController:
             result["charge_estimate"] = estimate
             result["charging_power"] = charger_status["charging_power"]
             self.last_status = result
+            self._add_history_point(self.last_status, charger_status)
             return self.last_status
 
         # -- Minimum daily charge check --
@@ -292,7 +337,7 @@ class SurplusController:
             mins_done = self._charge_seconds_today / 60
             result["min_charge_progress"] = f"{mins_done:.0f}/{self.min_charge_minutes}min"
             self.last_status = result
-            self._add_history_point(result)
+            self._add_history_point(result, charger_status)
             return self.last_status
 
         # -- Daytime: surplus-based charging with phase switching --
@@ -374,6 +419,6 @@ class SurplusController:
                 )
                 status["action"] = "waiting"
 
-        self._add_history_point(status)
+        self._add_history_point(status, charger_status)
         self.last_status = status
         return status
