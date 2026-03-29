@@ -276,11 +276,23 @@ n        # CSV log directory
             self.last_status = {"action": "skip", "reason": "charger_error"}
             return self.last_status
 
-        # No car connected -- nothing to do
+        # Always read Fronius so logs record solar data even without a car
+        power_flow = self.fronius.get_power_flow()
+        if power_flow is not None:
+            pv_power = power_flow["pv_power"]
+            load_power = power_flow["load_power"]
+            grid_power = power_flow["grid_power"]
+            surplus = -grid_power
+        else:
+            pv_power = load_power = grid_power = surplus = 0
+
+        # No car connected -- log solar data and idle
         if charger_status["car"] == 1:
             self._record_charging(False)
             self.daily_stats.record_session(False)
-            self.last_status = {"action": "idle", "reason": "no_car", "mode": self.mode}
+            self.last_status = {"action": "idle", "reason": "no_car", "mode": self.mode,
+                                "pv_power": pv_power, "load_power": load_power,
+                                "grid_power": grid_power, "surplus": surplus}
             self._add_history_point(self.last_status, charger_status)
             return self.last_status
 
@@ -341,17 +353,10 @@ n        # CSV log directory
             return self.last_status
 
         # -- Daytime: surplus-based charging with phase switching --
-        power_flow = self.fronius.get_power_flow()
         if power_flow is None:
             logger.warning("Could not read Fronius data, skipping cycle")
             return {"action": "skip", "reason": "fronius_error"}
 
-        grid_power = power_flow["grid_power"]
-        pv_power = power_flow["pv_power"]
-        load_power = power_flow["load_power"]
-
-        # Surplus = what we're exporting (negative grid = export)
-        surplus = -grid_power
         available = surplus - self.tolerance
 
         target_phases, target_amps = self._choose_phase_and_amps(available)
