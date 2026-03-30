@@ -6,6 +6,7 @@ import os
 import secrets
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from threading import Thread
+from datetime import date as _date
 from urllib.parse import urlparse, parse_qs
 from http.cookies import SimpleCookie
 
@@ -221,6 +222,14 @@ HTML_PAGE = """<!DOCTYPE html>
   .toggle input:checked + .slider { background: var(--accent); }
   .toggle input:checked + .slider::before { transform: translateX(20px); background: white; }
   .chart-wrap { width: 100%; height: 220px; }
+  .log-list { display: flex; flex-wrap: wrap; gap: 8px; }
+  .log-link {
+    display: inline-block; padding: 8px 14px; border: 1px solid var(--card-border);
+    border-radius: 8px; color: var(--text); text-decoration: none; font-size: 0.85em;
+    transition: border-color 0.2s, background 0.2s;
+  }
+  .log-link:hover { border-color: var(--accent); background: rgba(34,197,94,0.08); color: var(--accent); }
+  .log-link.today { border-color: var(--accent); color: var(--accent); }
   .refresh { text-align: center; color: var(--muted); font-size: 0.75em; margin-top: 12px; }
 </style>
 </head>
@@ -231,6 +240,23 @@ HTML_PAGE = """<!DOCTYPE html>
     <button class="logout-btn" id="logout-btn" onclick="logout()" style="display:none">Logout</button>
   </div>
   <div class="grid">
+    <!-- Mode Card (top) -->
+    <div class="card card-full">
+      <h2>Mode</h2>
+      <div class="modes">
+        <button class="mode-btn" onclick="setMode('auto')">Auto</button>
+        <button class="mode-btn" onclick="setMode('surplus')">Surplus Only</button>
+        <button class="mode-btn" onclick="setMode('force_on')">Force ON</button>
+        <button class="mode-btn" onclick="setMode('force_off')">Force OFF</button>
+      </div>
+      <div class="toggle-row">
+        <span class="toggle-label">Min. daily charge</span>
+        <label class="toggle">
+          <input type="checkbox" id="min-charge-toggle" onchange="toggleMinCharge(this.checked)">
+          <span class="slider"></span>
+        </label>
+      </div>
+    </div>
     <!-- Status Card -->
     <div class="card" id="status-card">
       <h2>Status</h2>
@@ -257,29 +283,14 @@ HTML_PAGE = """<!DOCTYPE html>
       <h2>Last 24 Hours</h2>
       <div class="chart-wrap"><canvas id="chart-24h"></canvas></div>
     </div>
-    <!-- Mode Card -->
-    <div class="card card-full">
-      <h2>Mode</h2>
-      <div class="modes">
-        <button class="mode-btn" onclick="setMode('auto')">Auto</button>
-        <button class="mode-btn" onclick="setMode('surplus')">Surplus Only</button>
-        <button class="mode-btn" onclick="setMode('force_on')">Force ON</button>
-        <button class="mode-btn" onclick="setMode('force_off')">Force OFF</button>
-      </div>
-      <div class="toggle-row">
-        <span class="toggle-label">Min. daily charge</span>
-        <label class="toggle">
-          <input type="checkbox" id="min-charge-toggle" onchange="toggleMinCharge(this.checked)">
-          <span class="slider"></span>
-        </label>
-      </div>
-    </div>
   </div>
-    <!-- Download Log -->
-    <div class="card card-full" style="text-align:center">
-      <a href="/api/log/download" class="mode-btn" style="display:inline-block;text-decoration:none;padding:12px 24px">
-        Download Today's Log (CSV)
-      </a>
+    <!-- Log Archive -->
+    <div class="card card-full">
+      <h2>Log Archive</h2>
+      <div class="log-list" id="log-list">Loading...</div>
+      <div style="margin-top:12px">
+        <a href="/api/log/download/all" class="mode-btn" style="display:inline-block;text-decoration:none;padding:10px 20px;font-size:0.85em">Download All (ZIP)</a>
+      </div>
     </div>
   <div class="refresh" id="updated"></div>
 </div>
@@ -334,6 +345,18 @@ function updateChart(chart, history, showSeconds) {
   chart.data.datasets[2].data = history.map(p => Math.round(p.charging_power || 0));
   chart.update('none');
 }
+function loadLogs() {
+  fetch("/api/logs").then(r => r.json()).then(data => {
+    const el = document.getElementById("log-list");
+    if (!data.dates || !data.dates.length) { el.textContent = "No log files yet."; return; }
+    const today = new Date().toISOString().slice(0, 10);
+    el.innerHTML = data.dates.map(d =>
+      "<a href=\"/api/log/download?date=" + d + "\" class=\"log-link" +
+      (d === today ? " today" : "") + "\" download>" + d + ".csv</a>"
+    ).join("");
+  }).catch(() => { document.getElementById("log-list").textContent = "Could not load logs."; });
+}
+
 function setMode(mode) { fetch('/api/mode?mode=' + mode).then(() => refresh()); }
 function toggleMinCharge(en) {
   fetch('/api/min_charge?enabled=' + (en ? '1' : '0'));
@@ -399,7 +422,9 @@ charts['10m'] = makeChart('chart-10m');
 charts['4h']  = makeChart('chart-4h');
 charts['24h'] = makeChart('chart-24h');
 refresh();
+loadLogs();
 setInterval(refresh, 5000);
+setInterval(loadLogs, 60000);
 if ('serviceWorker' in navigator) { navigator.serviceWorker.register('/sw.js'); }
 </script>
 </body>
@@ -474,25 +499,55 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.controller.set_min_charge_enabled(enabled)
             self._respond(200, "application/json", json.dumps({"ok": True, "enabled": enabled}))
 
-        elif parsed.path == "/api/log/download":
-            from datetime import date as _date
+        elif parsed.path == "/api/logs":
             log_dir = self.controller._log_dir
-            today = _date.today().isoformat()
-            log_path = os.path.join(log_dir, f"solar_{today}.csv")
+            dates = []
+            if os.path.isdir(log_dir):
+                for fname in sorted(os.listdir(log_dir), reverse=True):
+                    if fname.startswith("solar_") and fname.endswith(".csv"):
+                        dates.append(fname[6:-4])
+            self._respond(200, "application/json", json.dumps({"dates": dates}))
+
+        elif parsed.path == "/api/log/download/all":
+            import io, zipfile
+            log_dir = self.controller._log_dir
+            buf = io.BytesIO()
+            added = 0
+            if os.path.isdir(log_dir):
+                with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for fname in sorted(os.listdir(log_dir)):
+                        if fname.startswith("solar_") and fname.endswith(".csv"):
+                            zf.write(os.path.join(log_dir, fname), fname)
+                            added += 1
+            if added:
+                data = buf.getvalue()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Disposition", "attachment; filename=solar_logs.zip")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(data)
+            else:
+                self._respond(404, "application/json", json.dumps({"error": "No log files found"}))
+
+        elif parsed.path == "/api/log/download":
+            params = parse_qs(parsed.query)
+            log_date = params.get("date", [_date.today().isoformat()])[0]
+            log_dir = self.controller._log_dir
+            log_path = os.path.join(log_dir, f"solar_{log_date}.csv")
             if os.path.exists(log_path):
                 with open(log_path, "r") as f:
                     csv_data = f.read()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/csv")
-                self.send_header("Content-Disposition", f"attachment; filename=solar_{today}.csv")
+                self.send_header("Content-Disposition",
+                                 f"attachment; filename=solar_{log_date}.csv")
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
                 self.wfile.write(csv_data.encode())
             else:
                 self._respond(404, "application/json",
-                              json.dumps({"error": "No log file for today yet"}))
-
-
+                              json.dumps({"error": f"No log file for {log_date}"}))
         else:
             self._respond(404, "text/plain", "Not found")
 

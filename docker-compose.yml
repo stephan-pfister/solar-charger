@@ -6,5 +6,6 @@ services:
     network_mode: host
     volumes:
       - ./config.json:/app/config.json
+      - ./logs:/app/logs
     environment:
       - TZ=Europe/Berlin
