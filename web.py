@@ -351,8 +351,8 @@ function loadLogs() {
     if (!data.dates || !data.dates.length) { el.textContent = "No log files yet."; return; }
     const today = new Date().toISOString().slice(0, 10);
     el.innerHTML = data.dates.map(d =>
-      "<a href=\"/api/log/download?date=" + d + "\" class=\"log-link" +
-      (d === today ? " today" : "") + "\" download>" + d + ".csv</a>"
+      "<a href='/api/log/download?date=" + d + "' class='log-link" +
+      (d === today ? " today" : "") + "' download>" + d + ".csv</a>"
     ).join("");
   }).catch(() => { document.getElementById("log-list").textContent = "Could not load logs."; });
 }
