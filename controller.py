@@ -32,7 +32,7 @@ MODE_AUTO = "auto"          # surplus + night schedule
 MODE_FORCE_ON = "force_on"  # full speed, ignore surplus
 MODE_FORCE_OFF = "force_off"  # stop charging
 MODE_SURPLUS = "surplus"    # surplus only, no night charging
-nLOG_FIELDS = [
+LOG_FIELDS = [
     "timestamp", "action", "mode", "pv_power", "load_power",
     "grid_power", "surplus", "charging_power", "set_amps",
     "set_phases", "car_state", "force_state",
@@ -118,7 +118,7 @@ class SurplusController:
         # Daily charge tracking (minutes charged today)
         self._charge_seconds_today = 0
         self._last_charge_date = date.today()
-n        # CSV log directory
+        # CSV log directory
         self._log_dir = config.get("log_dir", "logs")
         os.makedirs(self._log_dir, exist_ok=True)
 
