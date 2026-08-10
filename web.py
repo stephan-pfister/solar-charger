@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import secrets
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 from datetime import date as _date
 from urllib.parse import urlparse, parse_qs
@@ -609,7 +609,7 @@ def start_web_server(controller, config=None, port=8080):
     _web_password = config.get("web_password")
     RequestHandler.controller = controller
     RequestHandler.config = config
-    server = HTTPServer(("0.0.0.0", port), RequestHandler)
+    server = ThreadingHTTPServer(("0.0.0.0", port), RequestHandler)
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
     logger.info(f"Web UI running at http://0.0.0.0:{port}")
