@@ -20,6 +20,7 @@ Logic:
 
 import csv
 import os
+import json
 import logging
 import time
 from collections import deque
@@ -42,8 +43,42 @@ LOG_FIELDS = [
 class DailyStats:
     """Track daily charging statistics (reset at midnight)."""
 
-    def __init__(self):
-        self.reset()
+    def __init__(self, log_dir="logs"):
+        self._log_dir = log_dir
+        self._state_path = os.path.join(log_dir, "daily_stats_state.json")
+        if not self._load():
+            self.reset()
+
+    def _load(self):
+        """Restore today's stats from disk after a restart, if available."""
+        try:
+            with open(self._state_path) as f:
+                data = json.load(f)
+            if data.get("date") == date.today().isoformat():
+                self.date = date.today()
+                self.solar_kwh = data.get("solar_kwh", 0.0)
+                self.grid_kwh = data.get("grid_kwh", 0.0)
+                self.sessions = data.get("sessions", 0)
+                self._was_charging = False
+                return True
+        except (FileNotFoundError, ValueError, OSError) as e:
+            logger.warning(f"DailyStats: no usable persisted state ({e}); starting fresh")
+        return False
+
+    def _save(self):
+        """Persist current stats so a restart doesn't lose today's numbers."""
+        try:
+            tmp = self._state_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({
+                    "date": self.date.isoformat(),
+                    "solar_kwh": self.solar_kwh,
+                    "grid_kwh": self.grid_kwh,
+                    "sessions": self.sessions,
+                }, f)
+            os.replace(tmp, self._state_path)
+        except OSError as e:
+            logger.warning(f"DailyStats: could not persist state: {e}")
 
     def reset(self):
         self.date = date.today()
@@ -51,6 +86,7 @@ class DailyStats:
         self.grid_kwh = 0.0
         self.sessions = 0
         self._was_charging = False
+        self._save()
 
     def check_midnight(self):
         today = date.today()
@@ -64,12 +100,14 @@ class DailyStats:
             self.solar_kwh += kwh
         else:
             self.grid_kwh += kwh
+        self._save()
 
     def record_session(self, is_charging):
         """Track charging session count."""
         if is_charging and not self._was_charging:
             self.sessions += 1
         self._was_charging = is_charging
+        self._save()
 
     def to_dict(self):
         return {
@@ -95,8 +133,9 @@ class SurplusController:
         self.min_charge_minutes = config.get("min_charge_minutes_per_day", 0)
         self.min_charge_enabled = self.min_charge_minutes > 0
 
-        # Override mode -- default is auto (surplus + night)
-        self.mode = MODE_AUTO
+        # Override mode -- default after (re)start is surplus-only
+        # (configurable via "default_mode" in config.json).
+        self.mode = config.get("default_mode", MODE_SURPLUS)
         self.last_status = {}
 
         # Hysteresis: wait N consecutive cycles below threshold before stopping
@@ -112,15 +151,15 @@ class SurplusController:
         # History: 24h at 10s interval = 8640 points
         self.history = deque(maxlen=8640)
 
-        # Daily stats
-        self.daily_stats = DailyStats()
-
         # Daily charge tracking (minutes charged today)
         self._charge_seconds_today = 0
         self._last_charge_date = date.today()
         # CSV log directory
         self._log_dir = config.get("log_dir", "logs")
         os.makedirs(self._log_dir, exist_ok=True)
+
+        # Daily stats (persisted to survive restarts)
+        self.daily_stats = DailyStats(self._log_dir)
 
     def set_mode(self, mode):
         """Set charging mode. Returns True if valid."""
