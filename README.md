@@ -10,7 +10,10 @@ Connects a **Fronius Symo** inverter to a **go-eCharger** (API v2) to automatica
 - **Web UI** — control and monitor from your phone at `http://<server-ip>:8080`
 - **Override modes** — Force ON, Force OFF, Surplus Only, Auto
 - **mDNS discovery** — auto-finds devices on your network
-- **Hysteresis** — waits 30s before stopping (handles passing clouds)
+- **Hysteresis** — waits 30s before stopping (handles passing clouds), and a
+  dwell time + power margin before switching phases (avoids contactor flapping)
+- **Closed-loop current** — measures what the car actually draws and compensates,
+  instead of assuming `amps x voltage x phases`
 
 ## How It Works
 
@@ -102,18 +105,28 @@ Edit `config.json`:
 {
     "fronius_ip": null,          // null = auto-discover via mDNS
     "charger_ip": null,          // null = auto-discover via mDNS
-    "min_surplus_watts": 1400,   // minimum surplus to consider charging
     "update_interval_seconds": 10,
     "min_amps": 6,               // minimum charging current
     "max_amps": 16,              // maximum charging current
-    "phases": 3,                 // wiring: 3-phase
     "voltage": 230,
-    "grid_tolerance_watts": 200, // allow small grid draw
+    "grid_tolerance_watts": 200, // safety margin kept out of the surplus
     "night_start_hour": 21,      // night charging starts at 21:00
     "night_end_hour": 5,         // night charging ends at 05:00
-    "web_port": 8080             // web UI port
+    "web_port": 8080,            // web UI port
+    "web_password": null,        // null = no login required
+    "min_charge_minutes_per_day": 0,
+
+    // Phase-switch hysteresis
+    "phase_switch_margin_watts": 500,  // extra headroom needed to go 3-phase
+    "phase_min_dwell_seconds": 300,    // minimum time between phase switches
+
+    // Closed-loop current correction
+    "max_power_offset_watts": 600      // cap on the learned per-phase shortfall
 }
 ```
+
+The minimum surplus is derived from `min_amps x voltage` (1380W for 1-phase,
+4140W for 3-phase), not configured separately.
 
 ## Web UI & API
 
@@ -131,9 +144,20 @@ Open `http://<server-ip>:8080` in your browser.
 ### API Endpoints
 
 ```
-GET /api/status              → current status as JSON
-GET /api/mode?mode=auto      → set mode (auto, surplus, force_on, force_off)
+GET  /api/status                    → current status as JSON
+POST /api/mode?mode=auto            → set mode (auto, surplus, force_on, force_off)
+POST /api/min_charge?enabled=1      → toggle minimum daily charge
+GET  /api/logs                      → list available log dates
+GET  /api/log/download?date=Y-M-D   → download one day as CSV
+GET  /api/log/download/all          → download all logs as ZIP
 ```
+
+`GET` still works on the two control endpoints so existing bookmarks and phone
+shortcuts keep working.
+
+`/api/status` includes `last_update_age` (seconds since the last control cycle);
+the UI shows a warning banner when the controller stops cycling. History is
+downsampled server-side to 300 points per chart.
 
 ## File Structure
 
@@ -144,10 +168,17 @@ GET /api/mode?mode=auto      → set mode (auto, surplus, force_on, force_off)
 ├── charger.py        # go-eCharger HTTP API v2 client
 ├── discovery.py      # mDNS auto-discovery
 ├── web.py            # Web UI and REST API
+├── test_controller.py # Unit tests (python3 -m unittest)
 ├── config.json       # Configuration
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
+```
+
+## Development
+
+```bash
+python3 -m unittest -v
 ```
 
 ## License

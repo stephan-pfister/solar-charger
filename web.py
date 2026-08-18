@@ -3,14 +3,18 @@
 import json
 import logging
 import os
+import re
 import secrets
-from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 from datetime import date as _date
 from urllib.parse import urlparse, parse_qs
 from http.cookies import SimpleCookie
 
 logger = logging.getLogger(__name__)
+
+_VALID_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 # In-memory session store
 _sessions = set()
@@ -45,17 +49,32 @@ MANIFEST_JSON = json.dumps({
 })
 
 SERVICE_WORKER_JS = """
-const CACHE = 'solar-charger-v2';
+const CACHE = 'solar-charger-v3';
 const PRECACHE = ['/', '/manifest.json', '/icon.svg'];
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(PRECACHE)).then(() => self.skipWaiting()));
 });
 self.addEventListener('activate', e => {
-  e.waitUntil(self.clients.claim());
+  // Drop caches from older versions, otherwise phones keep serving the old UI
+  e.waitUntil(
+    caches.keys()
+      .then(keys => Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k))))
+      .then(() => self.clients.claim())
+  );
 });
 self.addEventListener('fetch', e => {
   if (e.request.url.includes('/api/')) return;
-  e.respondWith(caches.match(e.request).then(r => r || fetch(e.request)));
+  // Network-first: a cache-first page meant UI updates never reached phones
+  // that had already installed the PWA. Cache stays as the offline fallback.
+  e.respondWith(
+    fetch(e.request)
+      .then(r => {
+        const copy = r.clone();
+        caches.open(CACHE).then(c => c.put(e.request, copy)).catch(() => {});
+        return r;
+      })
+      .catch(() => caches.match(e.request))
+  );
 });
 """
 
@@ -231,10 +250,48 @@ HTML_PAGE = """<!DOCTYPE html>
   .log-link:hover { border-color: var(--accent); background: rgba(34,197,94,0.08); color: var(--accent); }
   .log-link.today { border-color: var(--accent); color: var(--accent); }
   .refresh { text-align: center; color: var(--muted); font-size: 0.75em; margin-top: 12px; }
+  /* Grid/flex children need min-width:0, otherwise a wide canvas can stop the
+     column from ever shrinking back when the viewport gets narrower. */
+  .container, .grid > *, .card, .chart-wrap { min-width: 0; }
+  canvas { max-width: 100%; }
+  /* Collapsible log archive -- months are nested, only the newest is open */
+  details.archive > summary, details.month > summary {
+    cursor: pointer; list-style: none; user-select: none;
+  }
+  details.archive > summary::-webkit-details-marker,
+  details.month > summary::-webkit-details-marker { display: none; }
+  details.archive > summary {
+    font-size: 0.8em; text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--muted); font-weight: 500; display: flex;
+    justify-content: space-between; align-items: center;
+  }
+  details.archive > summary .chev, details.month > summary .chev {
+    transition: transform 0.2s; display: inline-block;
+  }
+  details.archive[open] > summary .chev, details.month[open] > summary .chev {
+    transform: rotate(90deg);
+  }
+  details.archive > summary:hover, details.month > summary:hover { color: var(--text); }
+  details.month {
+    border-top: 1px solid var(--card-border); padding: 10px 0 4px;
+  }
+  details.month > summary {
+    font-size: 0.85em; color: var(--text); display: flex; gap: 8px; align-items: center;
+  }
+  details.month > summary .cnt { color: var(--muted); font-size: 0.85em; }
+  details.month .log-list { margin-top: 10px; }
+  .archive-body { margin-top: 14px; }
+  .stale-banner {
+    display: none; background: rgba(239,68,68,0.12); border: 1px solid var(--red);
+    color: var(--red); border-radius: 12px; padding: 12px 16px; margin-bottom: 16px;
+    font-size: 0.85em; font-weight: 500;
+  }
+  .stale-banner.show { display: block; }
 </style>
 </head>
 <body>
 <div class="container">
+  <div class="stale-banner" id="stale-banner"></div>
   <div class="header">
     <h1>Solar Charger</h1>
     <button class="logout-btn" id="logout-btn" onclick="logout()" style="display:none">Logout</button>
@@ -244,10 +301,10 @@ HTML_PAGE = """<!DOCTYPE html>
     <div class="card card-full">
       <h2>Mode</h2>
       <div class="modes">
-        <button class="mode-btn" onclick="setMode('auto')">Auto</button>
-        <button class="mode-btn" onclick="setMode('surplus')">Surplus Only</button>
-        <button class="mode-btn" onclick="setMode('force_on')">Force ON</button>
-        <button class="mode-btn" onclick="setMode('force_off')">Force OFF</button>
+        <button class="mode-btn" data-mode="auto" onclick="setMode('auto')">Auto</button>
+        <button class="mode-btn" data-mode="surplus" onclick="setMode('surplus')">Surplus Only</button>
+        <button class="mode-btn" data-mode="force_on" onclick="setMode('force_on')">Force ON</button>
+        <button class="mode-btn" data-mode="force_off" onclick="setMode('force_off')">Force OFF</button>
       </div>
       <div class="toggle-row">
         <span class="toggle-label">Min. daily charge</span>
@@ -286,11 +343,15 @@ HTML_PAGE = """<!DOCTYPE html>
   </div>
     <!-- Log Archive -->
     <div class="card card-full">
-      <h2>Log Archive</h2>
-      <div class="log-list" id="log-list">Loading...</div>
-      <div style="margin-top:12px">
-        <a href="/api/log/download/all" class="mode-btn" style="display:inline-block;text-decoration:none;padding:10px 20px;font-size:0.85em">Download All (ZIP)</a>
-      </div>
+      <details class="archive" id="archive">
+        <summary><span>Log Archive <span id="log-count"></span></span><span class="chev">&#9656;</span></summary>
+        <div class="archive-body">
+          <div id="log-months">Loading...</div>
+          <div style="margin-top:14px">
+            <a href="/api/log/download/all" class="mode-btn" style="display:inline-block;text-decoration:none;padding:10px 20px;font-size:0.85em">Download All (ZIP)</a>
+          </div>
+        </div>
+      </details>
     </div>
   <div class="refresh" id="updated"></div>
 </div>
@@ -345,59 +406,115 @@ function updateChart(chart, history, showSeconds) {
   chart.data.datasets[2].data = history.map(p => Math.round(p.charging_power || 0));
   chart.update('none');
 }
+const MONTH_NAMES = ['Januar','Februar','M\u00e4rz','April','Mai','Juni','Juli',
+                    'August','September','Oktober','November','Dezember'];
+
 function loadLogs() {
   fetch("/api/logs").then(r => r.json()).then(data => {
-    const el = document.getElementById("log-list");
-    if (!data.dates || !data.dates.length) { el.textContent = "No log files yet."; return; }
+    const el = document.getElementById("log-months");
+    const countEl = document.getElementById("log-count");
+    if (!data.dates || !data.dates.length) {
+      el.textContent = "No log files yet."; countEl.textContent = ""; return;
+    }
+    countEl.textContent = "(" + data.dates.length + " days)";
     const today = new Date().toISOString().slice(0, 10);
-    el.innerHTML = data.dates.map(d =>
-      "<a href='/api/log/download?date=" + d + "' class='log-link" +
-      (d === today ? " today" : "") + "' download>" + d + ".csv</a>"
-    ).join("");
-  }).catch(() => { document.getElementById("log-list").textContent = "Could not load logs."; });
+
+    // Group by month so 140+ day-chips don't flood the page
+    const months = new Map();
+    data.dates.forEach(d => {
+      const key = d.slice(0, 7);
+      if (!months.has(key)) months.set(key, []);
+      months.get(key).push(d);
+    });
+
+    let first = true;
+    el.innerHTML = [...months.entries()].map(([key, days]) => {
+      const [y, m] = key.split("-");
+      const label = MONTH_NAMES[parseInt(m, 10) - 1] + " " + y;
+      const links = days.map(d =>
+        "<a href='/api/log/download?date=" + d + "' class='log-link" +
+        (d === today ? " today" : "") + "' download>" + d.slice(8) + ".</a>"
+      ).join("");
+      const open = first ? " open" : "";
+      first = false;
+      return "<details class='month'" + open + "><summary><span class='chev'>&#9656;</span>" +
+             label + " <span class='cnt'>" + days.length + "</span></summary>" +
+             "<div class='log-list'>" + links + "</div></details>";
+    }).join("");
+  }).catch(() => { document.getElementById("log-months").textContent = "Could not load logs."; });
 }
 
-function setMode(mode) { fetch('/api/mode?mode=' + mode).then(() => refresh()); }
+function setMode(mode) {
+  fetch('/api/mode?mode=' + mode, {method: 'POST'}).then(() => refresh());
+}
 function toggleMinCharge(en) {
-  fetch('/api/min_charge?enabled=' + (en ? '1' : '0'));
+  fetch('/api/min_charge?enabled=' + (en ? '1' : '0'), {method: 'POST'});
 }
 function logout() { fetch('/api/logout', {method:'POST'}).then(() => location.reload()); }
-function fmt(v, unit) { return v != null && v !== undefined ? Math.round(v) + ' ' + unit : '-'; }
+function fmt(v, unit) {
+  return (v !== null && v !== undefined && !isNaN(v)) ? Math.round(v) + ' ' + unit : '\u2014';
+}
+const CAR_STATES = {1: 'not connected', 2: 'charging', 3: 'connected, waiting', 4: 'complete'};
+const ACTION_LABELS = {
+  skip: 'no connection', idle: 'idle', charging: 'charging', stopped: 'stopped',
+  waiting: 'waiting', force_off: 'force off', force_on: 'force on',
+  night_mode: 'night mode', min_daily_charge: 'min. daily charge'
+};
+
+function showStale(msg) {
+  const b = document.getElementById('stale-banner');
+  if (msg) { b.textContent = msg; b.classList.add('show'); }
+  else { b.classList.remove('show'); }
+}
+
 function refresh() {
   fetch('/api/status').then(r => {
     if (r.status === 401) { location.reload(); return Promise.reject('auth'); }
+    if (!r.ok) return Promise.reject('http ' + r.status);
     return r.json();
   }).then(d => {
     if (!d) return;
     const isCharging = d.action === 'charging' || d.action === 'night_mode' ||
                        d.action === 'force_on' || d.action === 'min_daily_charge';
     const dotClass = isCharging ? 'dot charging' : 'dot';
-    let html = '';
+
+    // Controller health: last_update_age is the age of the last control cycle
+    const maxAge = (d.interval || 10) * 6;
+    if (d.last_update_age === null || d.last_update_age === undefined) {
+      showStale('Controller has not completed a cycle yet.');
+    } else if (d.last_update_age > maxAge) {
+      showStale('No control cycle for ' + Math.round(d.last_update_age) +
+                's \u2014 the controller may be stuck or offline.');
+    } else if (d.action === 'skip') {
+      showStale('Device unreachable (' + (d.reason || 'unknown') + ') \u2014 values below may be stale.');
+    } else {
+      showStale(null);
+    }
+
+    // Always render the same rows so the layout doesn't jump between states
     const fields = [
-      ['Action', '<span class="' + dotClass + '"></span>' + (d.action || '-')],
-      ['Mode', d.mode || '-'],
+      ['Action', '<span class="' + dotClass + '"></span>' +
+                 (ACTION_LABELS[d.action] || d.action || '\u2014')],
+      ['Car', CAR_STATES[d.car_state] || '\u2014'],
+      ['Mode', d.mode || '\u2014'],
       ['PV Power', fmt(d.pv_power, 'W')],
       ['Load', fmt(d.load_power, 'W')],
-      ['Grid', fmt(d.grid_power, 'W')],
+      [(d.grid_power < 0 ? 'Grid export' : 'Grid import'),
+       fmt(Math.abs(d.grid_power), 'W')],
       ['Surplus', fmt(d.surplus, 'W')],
       ['Charging', fmt(d.charging_power, 'W')],
-      ['Amps', d.current_amp ? d.current_amp + ' A' : '-'],
-      ['Phases', d.current_phases == 2 ? '3-phase' : d.current_phases == 1 ? '1-phase' : '-'],
+      ['Amps', (d.current_amp !== null && d.current_amp !== undefined)
+               ? d.current_amp + ' A' : '\u2014'],
+      ['Phases', d.current_phases == 2 ? '3-phase' : d.current_phases == 1 ? '1-phase' : '\u2014'],
       ['Est. remaining', d.charge_estimate ? d.charge_estimate.text : 'n/a'],
     ];
-    fields.forEach(f => {
-      if (f[1] && f[1] !== '-' && f[1] !== 'undefined W') {
-        html += '<div class="stat"><span class="label">' + f[0] +
-                '</span><span class="value">' + f[1] + '</span></div>';
-      }
-    });
-    if (!html) html = '<div class="stat"><span class="label">Action</span><span class="value">' +
-                       (d.action || 'waiting') + '</span></div>';
-    document.getElementById('status').innerHTML = html;
+    document.getElementById('status').innerHTML = fields.map(f =>
+      '<div class="stat"><span class="label">' + f[0] +
+      '</span><span class="value">' + f[1] + '</span></div>').join('');
+
     // Mode buttons
-    const map = {'auto':'auto','surplus only':'surplus','force on':'force_on','force off':'force_off'};
-    document.querySelectorAll('.mode-btn').forEach(btn => {
-      btn.classList.toggle('active', map[btn.textContent.toLowerCase()] === d.mode);
+    document.querySelectorAll('.mode-btn[data-mode]').forEach(btn => {
+      btn.classList.toggle('active', btn.dataset.mode === d.mode);
     });
     // Min charge toggle
     if (d.min_charge_enabled !== undefined) {
@@ -416,7 +533,11 @@ function refresh() {
     // Logout button
     document.getElementById('logout-btn').style.display = d.auth_enabled ? '' : 'none';
     document.getElementById('updated').textContent = 'Updated: ' + new Date().toLocaleTimeString();
-  }).catch(e => { if (e !== 'auth') console.error(e); });
+  }).catch(e => {
+    if (e === 'auth') return;
+    console.error(e);
+    showStale('Cannot reach the server \u2014 values below are stale.');
+  });
 }
 charts['10m'] = makeChart('chart-10m');
 charts['4h']  = makeChart('chart-4h');
@@ -481,23 +602,15 @@ class RequestHandler(BaseHTTPRequestHandler):
             status["daily_stats"] = self.controller.daily_stats.to_dict()
             status["min_charge_enabled"] = self.controller.min_charge_enabled
             status["auth_enabled"] = bool(_web_password)
+            # Age of the last control cycle -- lets the UI show when the
+            # controller has stopped running instead of silently going stale.
+            last = getattr(self.controller, "last_update_ts", 0) or 0
+            status["last_update_age"] = round(time.time() - last, 1) if last else None
+            status["interval"] = self.controller.interval
             self._respond(200, "application/json", json.dumps(status))
 
-        elif parsed.path == "/api/mode":
-            params = parse_qs(parsed.query)
-            mode = params.get("mode", [None])[0]
-            if mode and self.controller.set_mode(mode):
-                self._respond(200, "application/json", json.dumps({"ok": True, "mode": mode}))
-            else:
-                self._respond(400, "application/json",
-                              json.dumps({"ok": False, "error": "invalid mode",
-                                          "valid": ["auto", "force_on", "force_off", "surplus"]}))
-
-        elif parsed.path == "/api/min_charge":
-            params = parse_qs(parsed.query)
-            enabled = params.get("enabled", ["0"])[0] == "1"
-            self.controller.set_min_charge_enabled(enabled)
-            self._respond(200, "application/json", json.dumps({"ok": True, "enabled": enabled}))
+        elif parsed.path in ("/api/mode", "/api/min_charge"):
+            self._handle_control(parsed)
 
         elif parsed.path == "/api/logs":
             log_dir = self.controller._log_dir
@@ -524,7 +637,6 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header("Content-Type", "application/zip")
                 self.send_header("Content-Disposition", "attachment; filename=solar_logs.zip")
-                self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
                 self.wfile.write(data)
             else:
@@ -534,6 +646,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             params = parse_qs(parsed.query)
             log_date = params.get("date", [_date.today().isoformat()])[0]
             log_dir = self.controller._log_dir
+            if not _VALID_DATE.match(log_date):
+                self._respond(400, "application/json",
+                              json.dumps({"error": "invalid date"}))
+                return
             log_path = os.path.join(log_dir, f"solar_{log_date}.csv")
             if os.path.exists(log_path):
                 with open(log_path, "r") as f:
@@ -542,7 +658,6 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "text/csv")
                 self.send_header("Content-Disposition",
                                  f"attachment; filename=solar_{log_date}.csv")
-                self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
                 self.wfile.write(csv_data.encode())
             else:
@@ -551,8 +666,37 @@ class RequestHandler(BaseHTTPRequestHandler):
         else:
             self._respond(404, "text/plain", "Not found")
 
+    def _handle_control(self, parsed):
+        """Mode / min-charge endpoints, reachable via GET (compat) and POST."""
+        if parsed.path == "/api/mode":
+            params = parse_qs(parsed.query)
+            mode = params.get("mode", [None])[0]
+            if mode and self.controller.set_mode(mode):
+                self._respond(200, "application/json", json.dumps({"ok": True, "mode": mode}))
+            else:
+                self._respond(400, "application/json",
+                              json.dumps({"ok": False, "error": "invalid mode",
+                                          "valid": ["auto", "force_on", "force_off", "surplus"]}))
+            return True
+
+        if parsed.path == "/api/min_charge":
+            params = parse_qs(parsed.query)
+            enabled = params.get("enabled", ["0"])[0] == "1"
+            self.controller.set_min_charge_enabled(enabled)
+            self._respond(200, "application/json", json.dumps({"ok": True, "enabled": enabled}))
+            return True
+
+        return False
+
     def do_POST(self):
         parsed = urlparse(self.path)
+
+        if parsed.path in ("/api/mode", "/api/min_charge"):
+            if not self._is_authenticated():
+                self._respond(401, "application/json", '{"error":"unauthorized"}')
+                return
+            self._handle_control(parsed)
+            return
 
         if parsed.path == "/api/login":
             content_length = int(self.headers.get("Content-Length", 0))
@@ -568,7 +712,6 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Set-Cookie", f"session={token}; Path=/; HttpOnly; SameSite=Strict")
-                self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
                 self.wfile.write(b'{"ok":true}')
             else:
@@ -592,11 +735,12 @@ class RequestHandler(BaseHTTPRequestHandler):
         self._respond(404, "text/plain", "Not found")
 
     def _respond(self, code, content_type, body):
+        payload = body.encode() if isinstance(body, str) else body
         self.send_response(code)
         self.send_header("Content-Type", content_type)
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
-        self.wfile.write(body.encode() if isinstance(body, str) else body)
+        self.wfile.write(payload)
 
     def log_message(self, format, *args):
         pass  # suppress request logs
