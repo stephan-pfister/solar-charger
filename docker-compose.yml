@@ -8,4 +8,4 @@ services:
       - ./config.json:/app/config.json
       - ./logs:/app/logs
     environment:
-      - TZ=Europe/Berlin
+      - TZ=Europe/Zurich

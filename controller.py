@@ -46,6 +46,10 @@ class DailyStats:
     def __init__(self, log_dir="logs"):
         self._log_dir = log_dir
         self._state_path = os.path.join(log_dir, "daily_stats_state.json")
+        # Throttle disk writes: persisting on every cycle wears SD cards /
+        # keeps NAS volumes from sleeping. Save at most every _save_interval s.
+        self._save_interval = 30
+        self._last_save = 0.0
         if not self._load():
             self.reset()
 
@@ -61,12 +65,22 @@ class DailyStats:
                 self.sessions = data.get("sessions", 0)
                 self._was_charging = False
                 return True
-        except (FileNotFoundError, ValueError, OSError) as e:
-            logger.warning(f"DailyStats: no usable persisted state ({e}); starting fresh")
+        except FileNotFoundError:
+            logger.info("DailyStats: no saved state yet, starting fresh")
+        except (ValueError, OSError) as e:
+            logger.warning(f"DailyStats: could not read saved state ({e}); starting fresh")
         return False
 
-    def _save(self):
-        """Persist current stats so a restart doesn't lose today's numbers."""
+    def _save(self, force=False):
+        """Persist current stats so a restart doesn't lose today's numbers.
+
+        Throttled: only writes to disk every _save_interval seconds unless
+        force=True (used on reset/midnight so day boundaries never get lost).
+        """
+        now = time.time()
+        if not force and (now - self._last_save) < self._save_interval:
+            return
+        self._last_save = now
         try:
             tmp = self._state_path + ".tmp"
             with open(tmp, "w") as f:
@@ -86,7 +100,7 @@ class DailyStats:
         self.grid_kwh = 0.0
         self.sessions = 0
         self._was_charging = False
-        self._save()
+        self._save(force=True)
 
     def check_midnight(self):
         today = date.today()
@@ -141,6 +155,23 @@ class SurplusController:
         # Hysteresis: wait N consecutive cycles below threshold before stopping
         self._stop_count = 0
         self._stop_threshold = 3  # ~30s at 10s interval
+
+        # Phase-switch hysteresis: avoid rapid 1<->3 phase flapping near the
+        # threshold (each switch briefly interrupts charging and cycles the
+        # charger's contactor). Require extra headroom + a minimum dwell time
+        # before switching UP to 3-phase.
+        self._last_phase_switch = 0.0
+        self._phase_margin = config.get("phase_switch_margin_watts", 500)
+        self._phase_dwell = config.get("phase_min_dwell_seconds", 300)
+
+        # Timestamp of the last completed control cycle (for UI stale detection)
+        self.last_update_ts = 0.0
+
+        # Closed-loop correction: the car draws less than the pilot limit we
+        # set, so compensate instead of assuming amps * voltage * phases.
+        self._power_offset = 0.0        # watts per phase
+        self._max_power_offset = config.get("max_power_offset_watts", 600)
+        self._last_setpoint = None
 
         # Phase thresholds
         self.power_1phase = 1 * self.voltage       # 230W per amp at 1-phase
@@ -216,42 +247,133 @@ class SurplusController:
         m = int((hours - h) * 60)
         return {"hours": h, "minutes": m, "text": f"{h}h {m}m"}
 
-    def _choose_phase_and_amps(self, available_watts):
+    def _choose_phase_and_amps(self, available_watts, current=None):
         """Determine optimal phase mode and amperage for given surplus.
+
+        Args:
+            available_watts: surplus we may hand to the charger
+            current: the charger's current phase mode (1 or 2), for hysteresis
 
         Returns (phases, amps) where phases is 1 or 2 (psm value),
         or (None, 0) if surplus is too low.
+
+        Phase switching is hysteretic: stepping UP to 3-phase needs extra
+        headroom plus a minimum dwell time since the last switch, stepping
+        DOWN only needs the surplus to fall clearly below the threshold
+        (that direction is the safe one, so it is never delayed).
+
+        `available_watts` is compensated for the measured shortfall between the
+        pilot limit we set and what the car actually draws (see
+        _update_power_offset), so a full amp step isn't left unused.
         """
-        # Try 3-phase first (more efficient)
-        if available_watts >= self.min_3phase:
-            amps = int(min(available_watts / self.power_3phase, self.max_amps))
-            return 2, amps
+        if available_watts < self.min_1phase:
+            return None, 0
 
-        # Fall back to 1-phase
-        if available_watts >= self.min_1phase:
-            amps = int(min(available_watts / self.power_1phase, self.max_amps))
-            return 1, amps
+        dwell_ok = (time.time() - self._last_phase_switch) >= self._phase_dwell
 
-        return None, 0
+        if current == 2:
+            # Already 3-phase. What minimum 3-phase charging really pulls is
+            # below the nominal threshold (the car undershoots the pilot limit),
+            # so we can hold it a while longer without importing from the grid.
+            sustain = self.min_3phase - self._power_offset * 3
+            if available_watts >= (self.min_3phase - self._phase_margin):
+                target = 2
+            elif available_watts >= sustain and not dwell_ok:
+                target = 2      # ride out the dwell, still covered by surplus
+            else:
+                target = 1
+        elif current == 1:
+            # Only step up with extra headroom and after the dwell time
+            target = 2 if (dwell_ok and
+                           available_watts >= self.min_3phase + self._phase_margin) else 1
+        else:
+            target = 2 if available_watts >= self.min_3phase else 1
+
+        phase_count = 3 if target == 2 else 1
+        power_per_amp = self.power_3phase if target == 2 else self.power_1phase
+        # Compensate for the shortfall the car actually draws
+        usable = available_watts + self._power_offset * phase_count
+        amps = int(min(usable / power_per_amp, self.max_amps))
+
+        if amps < self.min_amps:
+            if target == 2 and current == 2:
+                # Inside the hysteresis band -- hold minimum 3-phase current
+                # rather than cycling the contactor for a brief dip.
+                amps = self.min_amps
+            elif target == 2:
+                target = 1
+                usable = available_watts + self._power_offset
+                amps = int(min(usable / self.power_1phase, self.max_amps))
+
+        if amps < self.min_amps:
+            return None, 0
+        return target, amps
+
+    def _update_power_offset(self, charger_status, commanded_amps, phases):
+        """Learn how far actual charging power falls short of the commanded value.
+
+        The car reliably draws less than the pilot limit we set (measured at
+        roughly 350W per phase on this installation), so assuming
+        amps * voltage * phases makes the controller under-use the surplus.
+        Only learned in steady state (same setpoint as last cycle, car actually
+        drawing) so the ramp-up lag doesn't pollute the estimate.
+        """
+        delivered = charger_status.get("charging_power") or 0
+        steady = (charger_status.get("car") == 2 and delivered > 0 and
+                  self._last_setpoint == (commanded_amps, phases))
+        self._last_setpoint = (commanded_amps, phases)
+        if not steady:
+            return
+
+        phase_count = 3 if phases == 2 else 1
+        commanded = commanded_amps * self.voltage * phase_count
+        offset = (commanded - delivered) / phase_count
+        offset = max(0.0, min(offset, self._max_power_offset))
+        # Exponential moving average -- slow enough to ignore single glitches
+        self._power_offset = 0.9 * self._power_offset + 0.1 * offset
+
+    def _apply_charging(self, charger_status, amps, phases, force_on=True):
+        """Send setpoints to the charger, but only if they differ from reality.
+
+        Comparing against the status we just read (rather than a cached copy)
+        means changes made in the go-e app are picked up automatically, while
+        an unchanged setpoint costs no write at all.
+        """
+        desired_frc = 2 if force_on else 1
+        need_phase = phases is not None and charger_status.get("phases") != phases
+        need_amps = charger_status.get("amp") != amps
+        need_frc = charger_status.get("force_state") != desired_frc
+
+        if not (need_phase or need_amps or need_frc):
+            return False
+
+        if need_phase:
+            self._last_phase_switch = time.time()
+        self.charger.set_charging(
+            amps, force_on=force_on, phases=phases if need_phase else None,
+        )
+        return True
+
+    def _apply_stop(self, charger_status):
+        """Stop charging, unless the charger is already stopped."""
+        if charger_status.get("force_state") == 1:
+            return False
+        self.charger.stop_charging()
+        return True
 
     def _force_full_speed(self, charger_status, label):
         """Charge at max amps, 3-phase. Uses frc=2 to restart from any state."""
         self._stop_count = 0
-        current_phases = charger_status["phases"]
-        needs_phase_switch = current_phases != 2
 
         if charger_status["car"] in (3, 4):
             car_states = {3: "waiting", 4: "complete"}
             logger.info(f"{label}: restarting from {car_states[charger_status['car']]} via frc=2")
 
-        self.charger.set_charging(
-            self.max_amps, force_on=True,
-            phases=2 if needs_phase_switch else None,
-        )
-        logger.info(
-            f"{label}: charging at {self.max_amps}A 3-phase "
-            f"({self.max_amps * self.power_3phase}W)"
-        )
+        if self._apply_charging(charger_status, self.max_amps, 2, force_on=True):
+            logger.info(
+                f"{label}: charging at {self.max_amps}A 3-phase "
+                f"({self.max_amps * self.power_3phase}W)"
+            )
         return {
             "action": label.lower().replace(" ", "_"),
             "mode": self.mode,
@@ -262,6 +384,14 @@ class SurplusController:
 
     def _add_history_point(self, status, charger_status=None):
         """Store a data point for the history chart and CSV log."""
+        # Surface the charger state on every path so the UI can always show
+        # whether a car is plugged in, not just while charging.
+        if charger_status:
+            status.setdefault("car_state", charger_status.get("car"))
+            status.setdefault("charging_power", charger_status.get("charging_power", 0))
+            status.setdefault("current_amp", charger_status.get("amp"))
+            status.setdefault("current_phases", charger_status.get("phases"))
+
         point = {
             "time": time.time(),
             "pv_power": status.get("pv_power", 0),
@@ -299,14 +429,44 @@ class SurplusController:
         except OSError as e:
             logger.warning(f"Could not write log: {e}")
 
-    def get_history(self, minutes=10):
-        """Return history data points for the last N minutes."""
+    def get_history(self, minutes=10, max_points=300):
+        """Return history data points for the last N minutes.
+
+        The deque is snapshotted with list() first: iterating it directly races
+        with the control thread's append() (which also pops from the left once
+        maxlen is reached) and raises "deque mutated during iteration".
+
+        Points are downsampled to at most max_points -- 24h at a 10s interval is
+        8640 points for a chart a few hundred pixels wide, which made /api/status
+        a ~650KB response on every poll.
+        """
         cutoff = time.time() - minutes * 60
-        return [p for p in self.history if p["time"] >= cutoff]
+        points = [p for p in list(self.history) if p["time"] >= cutoff]
+
+        if len(points) <= max_points:
+            return points
+
+        # Bucket into max_points slots, keeping the peak of each bucket so
+        # short surplus spikes stay visible instead of being averaged away.
+        step = len(points) / max_points
+        out = []
+        for i in range(max_points):
+            chunk = points[int(i * step):int((i + 1) * step)] or None
+            if chunk:
+                out.append(max(chunk, key=lambda p: p.get("pv_power", 0)))
+        return out
 
 
     def update(self):
         """Run one control cycle. Returns a status dict for logging."""
+        try:
+            return self._update_once()
+        finally:
+            # Stamped on every path (including errors) so the UI can tell
+            # "nothing is happening" from "the controller stopped running".
+            self.last_update_ts = time.time()
+
+    def _update_once(self):
         self.daily_stats.check_midnight()
 
         charger_status = self.charger.get_status()
@@ -344,7 +504,7 @@ class SurplusController:
 
         # -- Force OFF override --
         if self.mode == MODE_FORCE_OFF:
-            self.charger.stop_charging()  # always send frc=1
+            self._apply_stop(charger_status)
             self._record_charging(False)
             self.daily_stats.record_session(False)
             logger.info("Force OFF: charging stopped by override")
@@ -394,11 +554,15 @@ class SurplusController:
         # -- Daytime: surplus-based charging with phase switching --
         if power_flow is None:
             logger.warning("Could not read Fronius data, skipping cycle")
-            return {"action": "skip", "reason": "fronius_error"}
+            self.last_status = {"action": "skip", "reason": "fronius_error",
+                                "mode": self.mode, "car_state": charger_status.get("car")}
+            return self.last_status
 
         available = surplus - self.tolerance
 
-        target_phases, target_amps = self._choose_phase_and_amps(available)
+        target_phases, target_amps = self._choose_phase_and_amps(
+            available, current=charger_status["phases"]
+        )
 
         status = {
             "mode": self.mode,
@@ -416,8 +580,6 @@ class SurplusController:
         if target_amps >= self.min_amps:
             # Enough surplus -- charge (frc=2 forces charger on, even from stopped/complete)
             self._stop_count = 0
-            current_phases = charger_status["phases"]
-            needs_phase_switch = current_phases != target_phases
 
             phase_power = self.power_3phase if target_phases == 2 else self.power_1phase
             phase_label = "3-phase" if target_phases == 2 else "1-phase"
@@ -428,11 +590,10 @@ class SurplusController:
                     f"{'complete' if car_complete else 'waiting'} via frc=2"
                 )
 
-            self.charger.set_charging(
-                target_amps, force_on=True,
-                phases=target_phases if needs_phase_switch else None,
-            )
+            self._update_power_offset(charger_status, target_amps, target_phases)
+            self._apply_charging(charger_status, target_amps, target_phases, force_on=True)
             status["action"] = "charging"
+            status["power_offset"] = round(self._power_offset)
             status["set_amps"] = target_amps
             status["set_phases"] = 3 if target_phases == 2 else 1
 
@@ -450,11 +611,11 @@ class SurplusController:
             self._record_charging(False)
             self.daily_stats.record_session(False)
             if self._stop_count >= self._stop_threshold:
-                self.charger.stop_charging()  # always send frc=1 to ensure clean stop
-                logger.info(
-                    f"Surplus too low: {surplus:.0f}W "
-                    f"(need {self.min_1phase:.0f}W for 1-phase). Stopped (frc=1)."
-                )
+                if self._apply_stop(charger_status):
+                    logger.info(
+                        f"Surplus too low: {surplus:.0f}W "
+                        f"(need {self.min_1phase:.0f}W for 1-phase). Stopped (frc=1)."
+                    )
                 status["action"] = "stopped"
             else:
                 logger.info(

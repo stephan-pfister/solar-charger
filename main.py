@@ -127,18 +127,26 @@ def main():
     # Main loop
     logger.info(
         f"Starting surplus charging controller "
-        f"(interval={interval}s, min={config.get('min_surplus_watts', 1400)}W, "
-        f"phases={config.get('phases', 3)}, "
+        f"(interval={interval}s, min_1phase={controller.min_1phase:.0f}W, "
+        f"min_3phase={controller.min_3phase:.0f}W, "
         f"amps={config.get('min_amps', 6)}-{config.get('max_amps', 16)}A)"
     )
 
     while running:
+        started = time.monotonic()
         try:
             status = controller.update()
             logger.info(f"Cycle result: {status.get('action', '?')}")
         except Exception:
             logger.exception("Error in control cycle")
-        time.sleep(interval)
+
+        # Sleep the remainder of the interval, not a full interval on top of
+        # the work -- otherwise the cycle period drifts with every slow
+        # device response or disk write.
+        elapsed = time.monotonic() - started
+        if elapsed > interval:
+            logger.warning(f"Control cycle took {elapsed:.1f}s (interval is {interval}s)")
+        time.sleep(max(0.0, interval - elapsed))
 
     logger.info("Solar charger stopped.")
 
