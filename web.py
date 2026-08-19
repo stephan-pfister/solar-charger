@@ -372,6 +372,9 @@ function makeChart(canvasId) {
           fill: false, tension: 0.3, pointRadius: 0, borderWidth: 2 },
         { label: 'Charging', data: [], borderColor: '#3b82f6', backgroundColor: 'rgba(59,130,246,0.1)',
           fill: true, tension: 0.3, pointRadius: 0, borderWidth: 2 },
+        { label: 'Battery', data: [], borderColor: '#a855f7', backgroundColor: 'rgba(168,85,247,0.1)',
+          fill: false, tension: 0.3, pointRadius: 0, borderWidth: 2, borderDash: [5, 3],
+          spanGaps: true },
       ]
     },
     options: {
@@ -404,6 +407,12 @@ function updateChart(chart, history, showSeconds) {
   chart.data.datasets[0].data = history.map(p => Math.round(p.pv_power || 0));
   chart.data.datasets[1].data = history.map(p => Math.round(p.surplus || 0));
   chart.data.datasets[2].data = history.map(p => Math.round(p.charging_power || 0));
+  // Signed: above zero the house battery charges, below zero it discharges.
+  // null (not 0) for points recorded while the battery was unreachable, so a
+  // gap stays a gap instead of a fake flat line at zero.
+  const bat = history.map(p => p.bat_power == null ? null : Math.round(p.bat_power));
+  chart.data.datasets[3].data = bat;
+  chart.data.datasets[3].hidden = !bat.some(v => v !== null);
   chart.update('none');
 }
 const MONTH_NAMES = ['Januar','Februar','M\u00e4rz','April','Mai','Juni','Juli',

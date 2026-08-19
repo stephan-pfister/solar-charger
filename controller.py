@@ -550,6 +550,13 @@ class SurplusController:
             "surplus": status.get("surplus", 0),
             "charging_power": status.get("charging_power", 0),
         }
+        # House battery as one signed series: positive charges, negative
+        # discharges. Read from battery_status rather than the status dict --
+        # not every branch (force_off, night mode) merges the battery fields in,
+        # and a missing key would draw a false zero on the chart.
+        if self.battery_status:
+            point["bat_power"] = ((self.battery_status.get("charge_power") or 0)
+                                  - (self.battery_status.get("discharge_power") or 0))
         self.history.append(point)
         self._log_to_csv(status, charger_status)
 

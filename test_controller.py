@@ -238,8 +238,6 @@ class DailyStatsPersistence(unittest.TestCase):
         self.assertEqual(d.date, date.today())
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class FakeZendure:
@@ -558,3 +556,49 @@ class BatteryAcModeTest(unittest.TestCase):
         c.restore_battery_defaults()
         self.assertEqual(z.mode_writes[-1], 1)
         self.assertEqual(z.input_writes[-1], 1200)
+
+
+class BatteryHistorySeries(unittest.TestCase):
+    """bat_power on history points: signed, and absent when unreadable."""
+
+    def _c(self, status):
+        c = make_controller()
+        c.zendure = FakeZendure(status)
+        c.battery_status = c.zendure.get_status()
+        return c
+
+    def test_charging_is_positive(self):
+        c = self._c(battery(charge=1200))
+        c._add_history_point({"pv_power": 5000, "surplus": 3000}, None)
+        self.assertEqual(c.history[-1]["bat_power"], 1200)
+
+    def test_discharging_is_negative(self):
+        c = self._c(battery(discharge=800))
+        c._add_history_point({"pv_power": 0, "surplus": -500}, None)
+        self.assertEqual(c.history[-1]["bat_power"], -800)
+
+    def test_unreadable_battery_leaves_key_out(self):
+        """A missing key becomes a gap in the chart, not a fake zero."""
+        c = self._c(None)
+        c._add_history_point({"pv_power": 0, "surplus": 0}, None)
+        self.assertNotIn("bat_power", c.history[-1])
+
+    def test_survives_branches_without_battery_fields(self):
+        """force_off builds a status dict with no bat_* keys; the point still
+        carries the battery, because it is read from battery_status."""
+        c = self._c(battery(discharge=298))
+        c._add_history_point({"action": "force_off", "mode": "force_off"}, None)
+        self.assertEqual(c.history[-1]["bat_power"], -298)
+
+    def test_downsampling_keeps_the_field(self):
+        c = self._c(battery(charge=600))
+        for _ in range(900):
+            c._add_history_point({"pv_power": 1000, "surplus": 500}, None)
+        pts = c.get_history(minutes=60, max_points=100)
+        self.assertLessEqual(len(pts), 100)
+        self.assertTrue(all("bat_power" in p for p in pts))
+        self.assertEqual(pts[0]["bat_power"], 600)
+
+
+if __name__ == "__main__":
+    unittest.main()
