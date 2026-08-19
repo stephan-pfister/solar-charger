@@ -22,6 +22,8 @@ percent. Temperatures are 0.1 Kelvin.
 """
 
 import logging
+import time
+
 import requests
 
 logger = logging.getLogger(__name__)
@@ -30,15 +32,25 @@ logger = logging.getLogger(__name__)
 class ZendureClient:
     """Client for Zendure SolarFlow devices with the local zenSDK HTTP API."""
 
-    def __init__(self, ip, serial=None, timeout=2):
+    def __init__(self, ip, serial=None, timeout=4, cache_seconds=60):
         self.base_url = f"http://{ip}"
         self.serial = serial
-        # Deliberately short: this call sits in the 10s control loop next to
-        # the Fronius and charger reads. A slow battery must never stall
-        # charging control.
+        # Kept well under the 10s cycle: this call sits next to the Fronius and
+        # charger reads and a slow battery must never stall charging control.
+        # Measured on a SolarFlow 1600 AC+ with rssi -45dBm, so not a signal
+        # problem: the device answers in 0.3-1.3s when it answers at all, and
+        # times out outright on roughly two thirds of requests. 2s dropped 15
+        # of 22 cycles.
         self.timeout = timeout
+        # Because the device is that unreliable, a failed read falls back to
+        # the last good one for a while instead of reporting "no battery".
+        # SoC and power move slowly; a minute-old reading still beats losing
+        # the surplus correction and the charge/discharge control entirely.
+        self.cache_seconds = cache_seconds
+        self._last_good = None
+        self._last_good_ts = 0.0
 
-    def get_status(self):
+    def _read(self):
         """Read battery state. Returns a dict, or None if unreachable.
 
         Keys:
@@ -96,6 +108,27 @@ class ZendureClient:
         )
         return result
 
+    def get_status(self):
+        """Read battery state, falling back to the last good value.
+
+        Returns None only when there is no reading fresh enough to use. A
+        served-from-cache result carries stale_seconds so callers can tell.
+        """
+        fresh = self._read()
+        now = time.time()
+        if fresh is not None:
+            self._last_good = fresh
+            self._last_good_ts = now
+            return fresh
+
+        age = now - self._last_good_ts
+        if self._last_good is not None and age <= self.cache_seconds:
+            logger.info(f"Zendure unreachable, using reading from {age:.0f}s ago")
+            stale = dict(self._last_good)
+            stale["stale_seconds"] = round(age, 1)
+            return stale
+        return None
+
     def set_input_limit(self, watts):
         """Set the charge power limit. Returns True on success.
 
@@ -138,14 +171,21 @@ class ZendureClient:
             return False
         return self._write({name: max(0, int(watts))}, serial)
 
-    def _write(self, properties, serial):
+    def _write(self, properties, serial, attempts=2):
+        """Write properties, retrying once. The device drops requests often
+        enough that a single attempt leaves the battery uncontrolled."""
         payload = {"sn": serial, "properties": properties}
-        try:
-            resp = requests.post(f"{self.base_url}/properties/write",
-                                 json=payload, timeout=self.timeout)
-            resp.raise_for_status()
-        except requests.RequestException as e:
-            logger.error(f"Zendure write error: {e}")
-            return False
-        logger.info(f"Zendure set {properties}")
-        return True
+        for attempt in range(1, attempts + 1):
+            try:
+                resp = requests.post(f"{self.base_url}/properties/write",
+                                     json=payload, timeout=self.timeout)
+                resp.raise_for_status()
+            except requests.RequestException as e:
+                if attempt < attempts:
+                    logger.warning(f"Zendure write failed ({e}), retrying")
+                    continue
+                logger.error(f"Zendure write error: {e}")
+                return False
+            logger.info(f"Zendure set {properties}")
+            return True
+        return False

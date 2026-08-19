@@ -730,5 +730,81 @@ class StatusAlwaysCarriesReadings(unittest.TestCase):
         self.assertEqual(st["usable_surplus"], 3900)   # 4500 - 600 entladen
 
 
+class ZendureFlakyDevice(unittest.TestCase):
+    """The SolarFlow drops roughly two thirds of requests (measured: 15 read
+    errors in 22 cycles, at rssi -45dBm, so not a signal problem). A dropped
+    read must not mean "no battery"."""
+
+    def _client(self, responses, **kw):
+        import zendure
+        c = zendure.ZendureClient("1.2.3.4", serial="SN1", **kw)
+        self.calls = []
+
+        def fake_read():
+            self.calls.append(1)
+            return responses.pop(0) if responses else None
+        c._read = fake_read
+        return c
+
+    def test_good_read_passes_through(self):
+        c = self._client([{"soc": 50, "charge_power": 600}])
+        st = c.get_status()
+        self.assertEqual(st["soc"], 50)
+        self.assertNotIn("stale_seconds", st)
+
+    def test_failed_read_serves_last_good(self):
+        c = self._client([{"soc": 50, "charge_power": 600}, None])
+        c.get_status()
+        st = c.get_status()
+        self.assertEqual(st["soc"], 50)
+        self.assertIn("stale_seconds", st)
+
+    def test_cache_expires(self):
+        c = self._client([{"soc": 50}, None], cache_seconds=60)
+        c.get_status()
+        c._last_good_ts -= 61          # older than the window
+        self.assertIsNone(c.get_status())
+
+    def test_no_cache_yet_returns_none(self):
+        c = self._client([None])
+        self.assertIsNone(c.get_status())
+
+    def test_cached_value_does_not_become_the_new_baseline(self):
+        """Serving from cache must not refresh the timestamp, or a permanently
+        dead device would look alive forever."""
+        c = self._client([{"soc": 50}, None, None], cache_seconds=60)
+        c.get_status()
+        ts = c._last_good_ts
+        c.get_status()
+        self.assertEqual(c._last_good_ts, ts)
+
+    def test_write_retries_once(self):
+        import zendure
+        c = zendure.ZendureClient("1.2.3.4", serial="SN1")
+        attempts = []
+
+        def fake_post(url, json=None, timeout=None):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise zendure.requests.RequestException("dropped")
+            class R:
+                def raise_for_status(self): pass
+            return R()
+
+        with unittest.mock.patch.object(zendure.requests, "post", fake_post):
+            self.assertTrue(c.set_input_limit(800))
+        self.assertEqual(len(attempts), 2)
+
+    def test_write_gives_up_after_retry(self):
+        import zendure
+        c = zendure.ZendureClient("1.2.3.4", serial="SN1")
+
+        def always_fail(url, json=None, timeout=None):
+            raise zendure.requests.RequestException("dropped")
+
+        with unittest.mock.patch.object(zendure.requests, "post", always_fail):
+            self.assertFalse(c.set_input_limit(800))
+
+
 if __name__ == "__main__":
     unittest.main()

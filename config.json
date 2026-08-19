@@ -16,12 +16,13 @@
     "max_power_offset_watts": 600,
     "zendure_ip": null,
     "zendure_serial": null,
-    "zendure_timeout_seconds": 2,
+    "zendure_timeout_seconds": 4,
     "zendure_correction": false,
     "zendure_control": false,
     "zendure_max_charge_watts": 1200,
     "zendure_max_discharge_watts": 800,
     "zendure_min_soc_percent": 10,
     "zendure_reserve_watts": 200,
-    "zendure_deadband_watts": 75
+    "zendure_deadband_watts": 75,
+    "zendure_cache_seconds": 60
 }

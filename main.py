@@ -89,8 +89,12 @@ def main():
     zendure = None
     zendure_ip = config.get("zendure_ip")
     if zendure_ip:
-        zendure = ZendureClient(zendure_ip, serial=config.get("zendure_serial"),
-                                timeout=config.get("zendure_timeout_seconds", 2))
+        zendure = ZendureClient(
+            zendure_ip,
+            serial=config.get("zendure_serial"),
+            timeout=config.get("zendure_timeout_seconds", 4),
+            cache_seconds=config.get("zendure_cache_seconds", 60),
+        )
 
     controller = SurplusController(config, fronius, charger, zendure=zendure)
 
