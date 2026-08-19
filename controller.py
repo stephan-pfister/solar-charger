@@ -37,6 +37,7 @@ LOG_FIELDS = [
     "timestamp", "action", "mode", "pv_power", "load_power",
     "grid_power", "surplus", "charging_power", "set_amps",
     "set_phases", "car_state", "force_state",
+    "bat_soc", "bat_charge", "bat_discharge",
 ]
 
 
@@ -132,9 +133,10 @@ class DailyStats:
 
 
 class SurplusController:
-    def __init__(self, config, fronius, charger):
+    def __init__(self, config, fronius, charger, zendure=None):
         self.fronius = fronius
         self.charger = charger
+        self.zendure = zendure
         self.min_amps = config.get("min_amps", 6)
         self.max_amps = config.get("max_amps", 16)
         self.voltage = config.get("voltage", 230)
@@ -167,6 +169,12 @@ class SurplusController:
         # Timestamp of the last completed control cycle (for UI stale detection)
         self.last_update_ts = 0.0
 
+        # House battery (Zendure). Reading it is always safe; letting it change
+        # the control decision is opt-in until we have measured that the
+        # battery really sits behind the Fronius meter.
+        self.zendure_correction = config.get("zendure_correction", False)
+        self.battery_status = None
+
         # Closed-loop correction: the car draws less than the pilot limit we
         # set, so compensate instead of assuming amps * voltage * phases.
         self._power_offset = 0.0        # watts per phase
@@ -189,6 +197,8 @@ class SurplusController:
         self._log_dir = config.get("log_dir", "logs")
         os.makedirs(self._log_dir, exist_ok=True)
 
+        self._migrated_logs = set()
+
         # Daily stats (persisted to survive restarts)
         self.daily_stats = DailyStats(self._log_dir)
 
@@ -204,6 +214,36 @@ class SurplusController:
     def set_min_charge_enabled(self, enabled):
         """Toggle minimum daily charge feature."""
         self.min_charge_enabled = bool(enabled)
+
+    def _corrected_surplus(self, surplus):
+        """Remove house-battery discharge from the surplus the car may use.
+
+        The Zendure sits behind the Fronius meter, so when it discharges into
+        the house less power is drawn from the grid -- which looks exactly like
+        extra PV surplus. Charging the car on that would move energy from the
+        house battery into the car at roughly 75-80% round-trip efficiency.
+
+        Battery *charging* is deliberately NOT added back. While the battery
+        controls itself, that power is genuinely spoken for; handing it to the
+        car as well would pull the difference from the grid. Once we command
+        inputLimit ourselves that power becomes free anyway, because we set it
+        to zero rather than compensating for it on paper.
+        """
+        if not self.zendure_correction or not self.battery_status:
+            return surplus
+        return surplus - (self.battery_status.get("discharge_power") or 0)
+
+    def _battery_fields(self):
+        """Battery values for the status dict / CSV (empty when unavailable)."""
+        b = self.battery_status
+        if not b:
+            return {}
+        return {
+            "bat_soc": b.get("soc"),
+            "bat_charge": b.get("charge_power"),
+            "bat_discharge": b.get("discharge_power"),
+            "bat_input_limit": b.get("input_limit"),
+        }
 
     def _is_night(self):
         """Check if current time is within night charging window."""
@@ -406,6 +446,8 @@ class SurplusController:
         today = date.today().isoformat()
         log_path = os.path.join(self._log_dir, f"solar_{today}.csv")
         file_exists = os.path.exists(log_path)
+        if file_exists:
+            self._migrate_csv_header(log_path)
         try:
             with open(log_path, "a", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=LOG_FIELDS)
@@ -424,10 +466,45 @@ class SurplusController:
                     "set_phases": status.get("set_phases", ""),
                     "car_state": charger_status.get("car", "") if charger_status else "",
                     "force_state": charger_status.get("force_state", "") if charger_status else "",
+                    "bat_soc": status.get("bat_soc", ""),
+                    "bat_charge": status.get("bat_charge", ""),
+                    "bat_discharge": status.get("bat_discharge", ""),
                 }
                 writer.writerow(row)
         except OSError as e:
             logger.warning(f"Could not write log: {e}")
+
+    def _migrate_csv_header(self, log_path):
+        """Rewrite today's log once if its header predates the current columns.
+
+        DictWriter writes values in LOG_FIELDS order regardless of what is
+        already in the file, so appending new columns to an old file would
+        silently misalign every following row. Rewriting once keeps one file
+        per day and loses nothing; new columns are simply empty for old rows.
+        """
+        if log_path in self._migrated_logs:
+            return
+        self._migrated_logs.add(log_path)
+        try:
+            with open(log_path, newline="") as f:
+                reader = csv.reader(f)
+                header = next(reader, None)
+            if header is None or header == LOG_FIELDS:
+                return
+            with open(log_path, newline="") as f:
+                rows = list(csv.DictReader(f))
+            tmp = log_path + ".tmp"
+            with open(tmp, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=LOG_FIELDS,
+                                        extrasaction="ignore")
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow({k: row.get(k, "") for k in LOG_FIELDS})
+            os.replace(tmp, log_path)
+            logger.info(f"Migrated log header: {os.path.basename(log_path)} "
+                        f"({len(rows)} rows, +{len(LOG_FIELDS) - len(header)} columns)")
+        except (OSError, ValueError, csv.Error) as e:
+            logger.warning(f"Could not migrate log header, leaving as is: {e}")
 
     def get_history(self, minutes=10, max_points=300):
         """Return history data points for the last N minutes.
@@ -485,13 +562,19 @@ class SurplusController:
         else:
             pv_power = load_power = grid_power = surplus = 0
 
+        # House battery. Never fatal: if it cannot be read we simply fall back
+        # to the uncorrected surplus, i.e. exactly the behaviour without it.
+        self.battery_status = self.zendure.get_status() if self.zendure else None
+        usable_surplus = self._corrected_surplus(surplus)
+
         # No car connected -- log solar data and idle
         if charger_status["car"] == 1:
             self._record_charging(False)
             self.daily_stats.record_session(False)
             self.last_status = {"action": "idle", "reason": "no_car", "mode": self.mode,
                                 "pv_power": pv_power, "load_power": load_power,
-                                "grid_power": grid_power, "surplus": surplus}
+                                "grid_power": grid_power, "surplus": surplus,
+                                **self._battery_fields()}
             self._add_history_point(self.last_status, charger_status)
             return self.last_status
 
@@ -558,7 +641,7 @@ class SurplusController:
                                 "mode": self.mode, "car_state": charger_status.get("car")}
             return self.last_status
 
-        available = surplus - self.tolerance
+        available = usable_surplus - self.tolerance
 
         target_phases, target_amps = self._choose_phase_and_amps(
             available, current=charger_status["phases"]
@@ -570,7 +653,9 @@ class SurplusController:
             "load_power": load_power,
             "grid_power": grid_power,
             "surplus": surplus,
+            "usable_surplus": usable_surplus,
             "available": available,
+            **self._battery_fields(),
             "current_amp": charger_status["amp"],
             "current_phases": charger_status["phases"],
             "charging_power": charger_status["charging_power"],

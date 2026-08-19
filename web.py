@@ -451,6 +451,14 @@ function toggleMinCharge(en) {
   fetch('/api/min_charge?enabled=' + (en ? '1' : '0'), {method: 'POST'});
 }
 function logout() { fetch('/api/logout', {method:'POST'}).then(() => location.reload()); }
+function batteryLabel(d) {
+  if (d.bat_soc === null || d.bat_soc === undefined) return '\u2014';
+  var flow = '';
+  if (d.bat_charge > 0)         flow = ' \u2191 ' + Math.round(d.bat_charge) + ' W';
+  else if (d.bat_discharge > 0) flow = ' \u2193 ' + Math.round(d.bat_discharge) + ' W';
+  else                          flow = ' idle';
+  return d.bat_soc + ' %' + flow;
+}
 function fmt(v, unit) {
   return (v !== null && v !== undefined && !isNaN(v)) ? Math.round(v) + ' ' + unit : '\u2014';
 }
@@ -503,6 +511,7 @@ function refresh() {
        fmt(Math.abs(d.grid_power), 'W')],
       ['Surplus', fmt(d.surplus, 'W')],
       ['Charging', fmt(d.charging_power, 'W')],
+      ['House battery', batteryLabel(d)],
       ['Amps', (d.current_amp !== null && d.current_amp !== undefined)
                ? d.current_amp + ' A' : '\u2014'],
       ['Phases', d.current_phases == 2 ? '3-phase' : d.current_phases == 1 ? '1-phase' : '\u2014'],

@@ -3,6 +3,8 @@
 Run with:  python3 -m unittest -v
 """
 
+import csv
+import os
 import tempfile
 import threading
 import time
@@ -237,3 +239,107 @@ class DailyStatsPersistence(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FakeZendure:
+    """Stand-in for ZendureClient. status=None simulates an unreachable device."""
+
+    def __init__(self, status=None):
+        self.status = status
+        self.written = []
+
+    def get_status(self):
+        return self.status
+
+    def set_input_limit(self, watts):
+        self.written.append(watts)
+        return True
+
+
+def battery(charge=0, discharge=0, soc=50):
+    return {"soc": soc, "charge_power": charge, "discharge_power": discharge,
+            "input_limit": 600}
+
+
+class ZendureCorrection(unittest.TestCase):
+    """The house battery must never be mistaken for solar surplus."""
+
+    def _c(self, correction, status):
+        c = make_controller(zendure_correction=correction)
+        c.zendure = FakeZendure(status)
+        c.battery_status = c.zendure.get_status()
+        return c
+
+    def test_discharge_is_subtracted(self):
+        # 3000W apparent surplus, 800W of it is the battery emptying itself
+        c = self._c(True, battery(discharge=800))
+        self.assertEqual(c._corrected_surplus(3000), 2200)
+
+    def test_charging_is_not_added_back(self):
+        """That power is spoken for -- giving it to the car would import grid."""
+        c = self._c(True, battery(charge=600))
+        self.assertEqual(c._corrected_surplus(3000), 3000)
+
+    def test_correction_is_opt_in(self):
+        c = self._c(False, battery(discharge=800))
+        self.assertEqual(c._corrected_surplus(3000), 3000)
+
+    def test_unreachable_battery_changes_nothing(self):
+        """A dead battery must never block or distort charging."""
+        c = self._c(True, None)
+        self.assertIsNone(c.battery_status)
+        self.assertEqual(c._corrected_surplus(3000), 3000)
+        self.assertEqual(c._battery_fields(), {})
+
+    def test_no_battery_configured(self):
+        c = make_controller(zendure_correction=True)
+        self.assertEqual(c._corrected_surplus(3000), 3000)
+        self.assertEqual(c._battery_fields(), {})
+
+    def test_heavy_discharge_stops_the_car(self):
+        """Corrected surplus may go negative; the car must not charge then."""
+        c = self._c(True, battery(discharge=1500))
+        corrected = c._corrected_surplus(1000)
+        self.assertEqual(corrected, -500)
+        _, amps = c._choose_phase_and_amps(corrected - c.tolerance)
+        self.assertEqual(amps, 0)
+
+    def test_battery_fields_exposed_for_ui(self):
+        c = self._c(True, battery(charge=599, soc=13))
+        self.assertEqual(c._battery_fields()["bat_soc"], 13)
+        self.assertEqual(c._battery_fields()["bat_charge"], 599)
+
+
+class CsvHeaderMigration(unittest.TestCase):
+    """Adding columns must not misalign an existing day's log."""
+
+    def test_old_header_is_migrated_in_place(self):
+        c = make_controller()
+        path = os.path.join(c._log_dir, f"solar_{date.today().isoformat()}.csv")
+        old_fields = [f for f in C.LOG_FIELDS if not f.startswith("bat_")]
+        with open(path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=old_fields)
+            w.writeheader()
+            w.writerow({k: "1" for k in old_fields})
+
+        c._log_to_csv({"action": "idle", "bat_soc": 42}, {"car": 1})
+
+        with open(path, newline="") as f:
+            header = next(csv.reader(f))
+        with open(path, newline="") as f:
+            rows = list(csv.DictReader(f))
+
+        self.assertEqual(header, C.LOG_FIELDS)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["timestamp"], "1")   # old row survived
+        self.assertEqual(rows[0]["bat_soc"], "")      # new column empty
+        self.assertEqual(rows[1]["bat_soc"], "42")    # new row filled
+
+    def test_migration_runs_only_once(self):
+        c = make_controller()
+        path = os.path.join(c._log_dir, f"solar_{date.today().isoformat()}.csv")
+        c._log_to_csv({"action": "idle"}, {"car": 1})
+        c._log_to_csv({"action": "idle"}, {"car": 1})
+        self.assertIn(path, c._migrated_logs)
+        with open(path, newline="") as f:
+            self.assertEqual(len(list(csv.DictReader(f))), 2)

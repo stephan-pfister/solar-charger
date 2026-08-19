@@ -13,5 +13,9 @@
     "min_charge_minutes_per_day": 0,
     "phase_switch_margin_watts": 500,
     "phase_min_dwell_seconds": 300,
-    "max_power_offset_watts": 600
+    "max_power_offset_watts": 600,
+    "zendure_ip": null,
+    "zendure_serial": null,
+    "zendure_timeout_seconds": 2,
+    "zendure_correction": false
 }
