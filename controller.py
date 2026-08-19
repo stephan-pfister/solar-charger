@@ -733,14 +733,22 @@ class SurplusController:
             self._control_battery(grid_power,
                                   charger_status.get("charging_power") or 0)
 
+        # Every status dict carries the readings, whichever branch builds it.
+        # Force ON/OFF and night mode used to omit them, so switching mode made
+        # PV, load, grid, surplus and the battery vanish from the UI.
+        readings = {
+            "pv_power": pv_power, "load_power": load_power,
+            "grid_power": grid_power, "surplus": surplus,
+            "usable_surplus": usable_surplus,
+            **self._battery_fields(),
+        }
+
         # No car connected -- log solar data and idle
         if charger_status["car"] == 1:
             self._record_charging(False)
             self.daily_stats.record_session(False, car_connected=False)
-            self.last_status = {"action": "idle", "reason": "no_car", "mode": self.mode,
-                                "pv_power": pv_power, "load_power": load_power,
-                                "grid_power": grid_power, "surplus": surplus,
-                                **self._battery_fields()}
+            self.last_status = {"action": "idle", "reason": "no_car",
+                                "mode": self.mode, **readings}
             self._add_history_point(self.last_status, charger_status)
             return self.last_status
 
@@ -758,7 +766,7 @@ class SurplusController:
             self.daily_stats.record_session(False)
             logger.info("Force OFF: charging stopped by override")
             self.last_status = {"action": "force_off", "mode": self.mode,
-                                "charge_estimate": estimate}
+                                "charge_estimate": estimate, **readings}
             self._add_history_point(self.last_status, charger_status)
             return self.last_status
 
@@ -770,6 +778,7 @@ class SurplusController:
             result = self._force_full_speed(charger_status, "Force ON")
             result["charge_estimate"] = estimate
             result["charging_power"] = charger_status["charging_power"]
+            result.update(readings)
             self.last_status = result
             self._add_history_point(self.last_status, charger_status)
             return self.last_status
@@ -782,6 +791,7 @@ class SurplusController:
             result = self._force_full_speed(charger_status, "Night mode")
             result["charge_estimate"] = estimate
             result["charging_power"] = charger_status["charging_power"]
+            result.update(readings)
             self.last_status = result
             self._add_history_point(self.last_status, charger_status)
             return self.last_status
@@ -794,6 +804,7 @@ class SurplusController:
             result = self._force_full_speed(charger_status, "Min daily charge")
             result["charge_estimate"] = estimate
             result["charging_power"] = charger_status["charging_power"]
+            result.update(readings)
             mins_done = self._charge_seconds_today / 60
             result["min_charge_progress"] = f"{mins_done:.0f}/{self.min_charge_minutes}min"
             self.last_status = result

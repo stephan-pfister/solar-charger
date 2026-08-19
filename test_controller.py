@@ -10,7 +10,8 @@ import tempfile
 import threading
 import time
 import unittest
-from datetime import date
+import unittest.mock
+from datetime import date, datetime
 
 import controller as C
 
@@ -25,6 +26,33 @@ def make_controller(**overrides):
     }
     cfg.update(overrides)
     return C.SurplusController(cfg, fronius=None, charger=None)
+
+
+class FakeFronius:
+    def __init__(self, pv=0, load=0, grid=0):
+        self._pf = {"pv_power": pv, "load_power": load, "grid_power": grid}
+
+    def get_power_flow(self):
+        return dict(self._pf)
+
+
+class FakeChargerDevice:
+    """Full charger stand-in for end-to-end update() runs."""
+
+    def __init__(self, car=2, amp=10, power=3400, phases=1, frc=2):
+        self.state = {"car": car, "amp": amp, "charging_power": power,
+                      "phases": phases, "force_state": frc, "allowed": True,
+                      "battery_percent": None, "battery_capacity_wh": None}
+        self.calls = []
+
+    def get_status(self):
+        return dict(self.state)
+
+    def set_charging(self, amps, force_on=True, phases=None):
+        self.calls.append(("set", amps, force_on, phases))
+
+    def stop_charging(self):
+        self.calls.append(("stop",))
 
 
 class ChoosePhaseAndAmps(unittest.TestCase):
@@ -652,6 +680,54 @@ class SessionCounting(unittest.TestCase):
         self.assertEqual(st2.sessions, 1)
         st2.record_session(True, now=2000)
         self.assertEqual(st2.sessions, 2)
+
+
+class StatusAlwaysCarriesReadings(unittest.TestCase):
+    """No mode may drop the readings the UI renders.
+
+    Force ON/OFF and night mode used to build their status dict from scratch,
+    so switching mode made PV, load, grid, surplus and the battery disappear
+    from the status card.
+    """
+
+    READINGS = ["pv_power", "load_power", "grid_power", "surplus",
+                "usable_surplus", "bat_soc", "bat_charge", "bat_discharge"]
+
+    def _run(self, mode, car=2, hour=12):
+        fronius = FakeFronius(pv=6000, load=1500, grid=-4500)
+        charger = FakeChargerDevice(car=car, amp=10, power=3400)
+        c = C.SurplusController(
+            {"log_dir": tempfile.mkdtemp(), "default_mode": mode,
+             "zendure_correction": True, "zendure_control": False},
+            fronius, charger, zendure=FakeZendure(battery(discharge=600, soc=44)))
+        with unittest.mock.patch.object(C, "datetime") as dt:
+            dt.now.return_value = datetime(2026, 8, 19, hour, 0)
+            return c.update()
+
+    def _assert_complete(self, status, mode):
+        for key in self.READINGS:
+            self.assertIn(key, status, f"{mode}: {key} fehlt im Status")
+
+    def test_surplus_mode(self):
+        self._assert_complete(self._run(C.MODE_SURPLUS), "surplus")
+
+    def test_force_on(self):
+        self._assert_complete(self._run(C.MODE_FORCE_ON), "force_on")
+
+    def test_force_off(self):
+        self._assert_complete(self._run(C.MODE_FORCE_OFF), "force_off")
+
+    def test_night_mode(self):
+        self._assert_complete(self._run(C.MODE_AUTO, hour=23), "night")
+
+    def test_no_car(self):
+        self._assert_complete(self._run(C.MODE_SURPLUS, car=1), "idle")
+
+    def test_usable_surplus_subtracts_discharge(self):
+        """The UI shows this instead of the raw surplus, so it must be right."""
+        st = self._run(C.MODE_SURPLUS)
+        self.assertEqual(st["surplus"], 4500)
+        self.assertEqual(st["usable_surplus"], 3900)   # 4500 - 600 entladen
 
 
 if __name__ == "__main__":

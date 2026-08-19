@@ -374,7 +374,7 @@ function makeChart(canvasId) {
           fill: true, tension: 0.3, pointRadius: 0, borderWidth: 2 },
         { label: 'Battery', data: [], borderColor: '#a855f7', backgroundColor: 'rgba(168,85,247,0.1)',
           fill: false, tension: 0.3, pointRadius: 0, borderWidth: 2, borderDash: [5, 3],
-          spanGaps: true },
+          spanGaps: true, yAxisID: 'yBat' },
       ]
     },
     options: {
@@ -385,7 +385,15 @@ function makeChart(canvasId) {
              grid: { color: 'rgba(100,116,139,0.1)' } },
         y: { ticks: { color: '#64748b', font: { size: 10 },
              callback: v => v >= 1000 ? (v/1000).toFixed(1)+'kW' : v+'W' },
-             grid: { color: 'rgba(100,116,139,0.1)' } }
+             grid: { color: 'rgba(100,116,139,0.1)' } },
+        // The house battery moves at a few hundred watts while PV and surplus
+        // swing by kilowatts. On the shared axis its line collapses onto zero,
+        // so give it its own scale on the right.
+        yBat: { position: 'right', suggestedMin: -1500, suggestedMax: 1500,
+                ticks: { color: '#a855f7', font: { size: 10 },
+                  callback: v => (v > 0 ? '+' : '') + (Math.abs(v) >= 1000
+                    ? (v/1000).toFixed(1)+'kW' : v+'W') },
+                grid: { drawOnChartArea: false } }
       }
     }
   });
@@ -519,15 +527,23 @@ function refresh() {
       ['Load', fmt(d.load_power, 'W')],
       [(d.grid_power < 0 ? 'Grid export' : 'Grid import'),
        fmt(Math.abs(d.grid_power), 'W')],
-      ['Surplus', fmt(d.surplus, 'W')],
+      // Raw surplus is just -grid, so showing both is a duplicate. Show what
+      // the controller actually decides on: surplus minus battery discharge.
+      ['Surplus', fmt(d.usable_surplus != null ? d.usable_surplus : d.surplus, 'W')],
       ['Charging', fmt(d.charging_power, 'W')],
       ['House battery', batteryLabel(d)],
-      ['Amps', (d.current_amp !== null && d.current_amp !== undefined)
-               ? d.current_amp + ' A' : '\u2014'],
-      ['Phases', d.current_phases == 2 ? '3-phase' : d.current_phases == 1 ? '1-phase' : '\u2014'],
-      ['Est. remaining', d.charge_estimate ? d.charge_estimate.text : 'n/a'],
+      // Setpoints only mean something while current is actually flowing.
+      ['Amps', !isCharging ? null
+               : (d.current_amp !== null && d.current_amp !== undefined)
+                 ? d.current_amp + ' A' : '\u2014'],
+      ['Phases', !isCharging ? null
+                 : d.current_phases == 2 ? '3-phase'
+                 : d.current_phases == 1 ? '1-phase' : '\u2014'],
+      // The EX30 does not report its state of charge to the charger, so this
+      // is permanently unavailable. Hide the row instead of showing "n/a".
+      ['Est. remaining', d.charge_estimate ? d.charge_estimate.text : null],
     ];
-    document.getElementById('status').innerHTML = fields.map(f =>
+    document.getElementById('status').innerHTML = fields.filter(f => f[1] !== null).map(f =>
       '<div class="stat"><span class="label">' + f[0] +
       '</span><span class="value">' + f[1] + '</span></div>').join('');
 
