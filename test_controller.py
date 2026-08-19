@@ -600,5 +600,59 @@ class BatteryHistorySeries(unittest.TestCase):
         self.assertEqual(pts[0]["bat_power"], 600)
 
 
+class SessionCounting(unittest.TestCase):
+    """One plug-in is one session, however cloudy the day is."""
+
+    def _stats(self):
+        return C.DailyStats(tempfile.mkdtemp())
+
+    def test_single_run_counts_once(self):
+        st = self._stats()
+        for i in range(50):
+            st.record_session(True, now=1000 + i * 10)
+        self.assertEqual(st.sessions, 1)
+
+    def test_short_dip_does_not_split(self):
+        st = self._stats()
+        st.record_session(True, now=1000)
+        st.record_session(False, now=1010)
+        st.record_session(True, now=1020)
+        self.assertEqual(st.sessions, 1)
+
+    def test_long_pause_while_plugged_in_is_still_one_session(self):
+        """Hours of cloud with the cable in is one visit, not two."""
+        st = self._stats()
+        st.record_session(True, now=1000)
+        for t in range(1010, 1010 + 4 * 3600, 10):
+            st.record_session(False, now=t)
+        st.record_session(True, now=1010 + 4 * 3600)
+        self.assertEqual(st.sessions, 1)
+
+    def test_unplug_and_replug_is_two(self):
+        st = self._stats()
+        st.record_session(True, now=1000)
+        for t in range(1010, 1200, 10):
+            st.record_session(False, car_connected=False, now=t)
+        st.record_session(True, now=1300)
+        self.assertEqual(st.sessions, 2)
+
+    def test_brief_car_glitch_does_not_double_count(self):
+        """One cycle of car=1 is a charger blip, not a new visit."""
+        st = self._stats()
+        st.record_session(True, now=1000)
+        st.record_session(False, car_connected=False, now=1010)
+        st.record_session(True, now=1020)
+        self.assertEqual(st.sessions, 1)
+
+    def test_restart_does_not_resume_a_stale_session(self):
+        d = tempfile.mkdtemp()
+        st = C.DailyStats(d)
+        st.record_session(True, now=1000)
+        st2 = C.DailyStats(d)
+        self.assertEqual(st2.sessions, 1)
+        st2.record_session(True, now=2000)
+        self.assertEqual(st2.sessions, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

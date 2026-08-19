@@ -33,6 +33,10 @@ MODE_AUTO = "auto"          # surplus + night schedule
 MODE_FORCE_ON = "force_on"  # full speed, ignore surplus
 MODE_FORCE_OFF = "force_off"  # stop charging
 MODE_SURPLUS = "surplus"    # surplus only, no night charging
+# A session ends when the car is unplugged, not when charging pauses. This
+# debounce absorbs a charger that briefly misreports "no car".
+DISCONNECT_DEBOUNCE_SECONDS = 60
+
 LOG_FIELDS = [
     "timestamp", "action", "mode", "pv_power", "load_power",
     "grid_power", "surplus", "charging_power", "set_amps",
@@ -66,6 +70,11 @@ class DailyStats:
                 self.grid_kwh = data.get("grid_kwh", 0.0)
                 self.sessions = data.get("sessions", 0)
                 self._was_charging = False
+                # A restart ends any running session: we cannot know whether
+                # the car kept charging across it, and resuming a stale session
+                # would under-count. Worst case the current visit counts twice.
+                self._session_active = False
+                self._disconnected_since = None
                 return True
         except FileNotFoundError:
             logger.info("DailyStats: no saved state yet, starting fresh")
@@ -102,6 +111,8 @@ class DailyStats:
         self.grid_kwh = 0.0
         self.sessions = 0
         self._was_charging = False
+        self._session_active = False
+        self._disconnected_since = None
         self._save(force=True)
 
     def check_midnight(self):
@@ -118,12 +129,38 @@ class DailyStats:
             self.grid_kwh += kwh
         self._save()
 
-    def record_session(self, is_charging):
-        """Track charging session count."""
-        if is_charging and not self._was_charging:
-            self.sessions += 1
-        self._was_charging = is_charging
-        self._save()
+    def record_session(self, is_charging, car_connected=True, now=None):
+        """Count charging sessions -- one per visit of the car.
+
+        Surplus charging dips below the threshold constantly: a single passing
+        cloud produces one "waiting" cycle. Counting each resume as a new
+        session turned 2026-08-18 into 117 sessions on a day the car was
+        plugged in exactly once.
+
+        So charging gaps never end a session, however long. Only unplugging
+        does, debounced by DISCONNECT_DEBOUNCE_SECONDS so that a charger that
+        blips car=1 for a cycle does not double-count the visit.
+        """
+        now = now or time.time()
+
+        if car_connected:
+            self._disconnected_since = None
+        elif self._disconnected_since is None:
+            self._disconnected_since = now
+
+        if is_charging:
+            if not self._session_active:
+                self.sessions += 1
+                self._session_active = True
+                self._save(force=True)
+            self._was_charging = True
+            return
+
+        self._was_charging = False
+        if (self._session_active and self._disconnected_since is not None
+                and now - self._disconnected_since >= DISCONNECT_DEBOUNCE_SECONDS):
+            self._session_active = False
+            self._save(force=True)
 
     def to_dict(self):
         return {
@@ -699,7 +736,7 @@ class SurplusController:
         # No car connected -- log solar data and idle
         if charger_status["car"] == 1:
             self._record_charging(False)
-            self.daily_stats.record_session(False)
+            self.daily_stats.record_session(False, car_connected=False)
             self.last_status = {"action": "idle", "reason": "no_car", "mode": self.mode,
                                 "pv_power": pv_power, "load_power": load_power,
                                 "grid_power": grid_power, "surplus": surplus,
