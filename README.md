@@ -10,7 +10,9 @@ Connects a **Fronius Symo** inverter to a **go-eCharger** (API v2) to automatica
 - **Web UI** — control and monitor from your phone at `http://<server-ip>:8080`
 - **Override modes** — Force ON, Force OFF, Surplus Only, Auto
 - **mDNS discovery** — auto-finds devices on your network
-- **Hysteresis** — waits 30s before stopping (handles passing clouds), and a
+- **Hysteresis** — waits 30s before stopping (handles passing clouds)
+- **House battery aware** — reads a Zendure SolarFlow so its discharge is not
+  mistaken for solar surplus, and a
   dwell time + power margin before switching phases (avoids contactor flapping)
 - **Closed-loop current** — measures what the car actually draws and compensates,
   instead of assuming `amps x voltage x phases`
@@ -166,6 +168,7 @@ downsampled server-side to 300 points per chart.
 ├── controller.py     # Surplus logic, phase switching, night mode
 ├── fronius.py        # Fronius Solar API v1 client
 ├── charger.py        # go-eCharger HTTP API v2 client
+├── zendure.py        # Zendure SolarFlow local zenSDK client (optional)
 ├── discovery.py      # mDNS auto-discovery
 ├── web.py            # Web UI and REST API
 ├── test_controller.py # Unit tests (python3 -m unittest)
@@ -180,6 +183,54 @@ downsampled server-side to 300 points per chart.
 ```bash
 python3 -m unittest -v
 ```
+
+## House battery (Zendure SolarFlow)
+
+Optional. Set `zendure_ip` and `zendure_serial` in `config.json`; leave
+`zendure_ip` at `null` and nothing changes.
+
+The device serves the local zenSDK HTTP API on port 80 with no authentication
+and no cloud connection:
+
+```bash
+curl http://<zendure-ip>/properties/report
+```
+
+Two things about that API are easy to get wrong:
+
+- **The power names read backwards.** They are written from the hub's point of
+  view: `outputPackPower` is the hub sending power *out to* the pack, i.e. the
+  battery **charging**. `packInputPower` is power coming *in from* the pack,
+  i.e. **discharging**.
+- **SoC settings are stored times ten.** `socSet: 1000` means 100%, `minSoc: 100`
+  means 10%. Writing `100` to `socSet` would set it to 10%.
+
+### Why the surplus needs correcting
+
+The battery sits behind the Fronius meter. Measured on a SolarFlow 1600 AC+ by
+stopping its charging three times and watching `P_Load`: the house load tracked
+the battery 1:1 (median ratio 0.96 over 16 paired samples). So when the battery
+discharges into the house, less power is drawn from the grid — which looks
+exactly like extra PV surplus. Charging the car on that moves energy out of the
+house battery at roughly 75-80% round-trip efficiency.
+
+With `zendure_correction: true` the controller subtracts battery discharge from
+the surplus. Battery *charging* is deliberately not added back: while the
+battery regulates itself that power is genuinely spoken for, and handing it to
+the car as well would pull the difference from the grid.
+
+The battery is a sensor, never a prerequisite. If it cannot be reached the
+controller falls back to the uncorrected surplus, and the read uses a 2s
+timeout so it cannot stall the 10s control loop.
+
+### Writing to the device
+
+`ZendureClient.set_input_limit()` exists but is not used by the control loop
+yet. On a device with HEMS enabled in the Zendure app, writes are accepted and
+then **reverted after about 5 seconds** by the app's own regulation — verified
+on firmware message schema v3. Commanding the battery therefore requires
+disabling HEMS in the app first, which also means the controller takes over
+responsibility for charging the battery.
 
 ## License
 
