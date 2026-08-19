@@ -15,6 +15,7 @@ from pathlib import Path
 from discovery import DeviceDiscovery
 from fronius import FroniusClient
 from charger import GoECharger
+from zendure import ZendureClient
 from controller import SurplusController
 from web import start_web_server
 
@@ -83,7 +84,15 @@ def main():
 
     fronius = FroniusClient(fronius_ip)
     charger = GoECharger(charger_ip)
-    controller = SurplusController(config, fronius, charger)
+
+    # House battery is optional -- without it everything behaves as before.
+    zendure = None
+    zendure_ip = config.get("zendure_ip")
+    if zendure_ip:
+        zendure = ZendureClient(zendure_ip, serial=config.get("zendure_serial"),
+                                timeout=config.get("zendure_timeout_seconds", 2))
+
+    controller = SurplusController(config, fronius, charger, zendure=zendure)
 
     # Test connectivity
     logger.info("Testing Fronius connection...")
@@ -107,6 +116,22 @@ def main():
         f"Charger OK — Car: {car_states.get(cs['car'], '?')}, "
         f"Amp: {cs['amp']}A"
     )
+
+    if zendure:
+        logger.info("Testing Zendure connection...")
+        bs = zendure.get_status()
+        if bs is None:
+            # Not fatal: the battery is a sensor, not a prerequisite.
+            logger.warning("Cannot reach Zendure — continuing without it.")
+        else:
+            logger.info(
+                f"Zendure OK — SoC: {bs['soc']}%, charge: {bs['charge_power']}W, "
+                f"discharge: {bs['discharge_power']}W, limit: {bs['input_limit']}W"
+            )
+            logger.info(
+                "Zendure surplus correction: "
+                + ("ON" if controller.zendure_correction else "OFF (logging only)")
+            )
 
     # Graceful shutdown
     running = True
