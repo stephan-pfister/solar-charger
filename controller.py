@@ -38,6 +38,7 @@ LOG_FIELDS = [
     "grid_power", "surplus", "charging_power", "set_amps",
     "set_phases", "car_state", "force_state",
     "bat_soc", "bat_charge", "bat_discharge",
+    "bat_in_limit", "bat_out_limit",
 ]
 
 
@@ -175,6 +176,19 @@ class SurplusController:
         self.zendure_correction = config.get("zendure_correction", False)
         self.battery_status = None
 
+        # Active battery control. Only meaningful with HEMS switched off in the
+        # Zendure app -- with HEMS on the device overwrites our writes within
+        # seconds. With HEMS off nothing regulates the battery, so if we do not
+        # drive it, it charges at a fixed limit regardless of sun and never
+        # discharges again.
+        self.zendure_control = config.get("zendure_control", False)
+        self.zendure_max_charge = config.get("zendure_max_charge_watts", 1200)
+        self.zendure_max_discharge = config.get("zendure_max_discharge_watts", 800)
+        self.zendure_min_soc = config.get("zendure_min_soc_percent", 10)
+        self.zendure_reserve = config.get("zendure_reserve_watts", 200)
+        self.zendure_deadband = config.get("zendure_deadband_watts", 75)
+        self._battery_setpoint = (None, None)   # (input_limit, output_limit)
+
         # Closed-loop correction: the car draws less than the pilot limit we
         # set, so compensate instead of assuming amps * voltage * phases.
         self._power_offset = 0.0        # watts per phase
@@ -243,7 +257,87 @@ class SurplusController:
             "bat_charge": b.get("charge_power"),
             "bat_discharge": b.get("discharge_power"),
             "bat_input_limit": b.get("input_limit"),
+            "bat_output_limit": b.get("output_limit"),
         }
+
+    def _control_battery(self, grid_power, car_power):
+        """Drive the house battery so the utility meter sits near zero.
+
+        Sign convention: grid_power > 0 means importing. Two corrections are
+        needed before a setpoint can be computed:
+
+          * The charger is NOT behind the Fronius meter, so its draw has to be
+            added by hand to get the real exchange at the utility meter.
+          * The battery IS behind the meter, so its current charge/discharge is
+            already contained in grid_power. Backing it out gives the "neutral"
+            grid -- what the meter would read if the battery did nothing --
+            which is the only stable basis for a new setpoint. Without this the
+            loop chases its own tail: charging at 1200W while importing 300W
+            would look like a reason to discharge, when in truth there is 900W
+            of spare export.
+
+        The car has priority: its measured draw is subtracted first, so the
+        battery only ever gets what is left over.
+        """
+        if not (self.zendure_control and self.zendure and self.battery_status):
+            return
+
+        b = self.battery_status
+        charge = b.get("charge_power") or 0
+        discharge = b.get("discharge_power") or 0
+        soc = b.get("soc")
+
+        real_grid = grid_power + car_power
+        neutral_grid = real_grid - charge + discharge
+
+        if neutral_grid < -self.zendure_reserve:
+            spare = -neutral_grid - self.zendure_reserve
+            target_in = int(min(spare, self.zendure_max_charge))
+            target_out = 0
+        else:
+            target_in = 0
+            if soc is not None and soc <= self.zendure_min_soc:
+                target_out = 0
+            else:
+                target_out = int(min(max(neutral_grid, 0), self.zendure_max_discharge))
+
+        self._apply_battery_limits(target_in, target_out)
+
+    def _apply_battery_limits(self, input_limit, output_limit):
+        """Write limits, but only when they actually moved.
+
+        Same reasoning as for the charger: a setpoint resent every 10s is
+        thousands of pointless writes a day.
+        """
+        last_in, last_out = self._battery_setpoint
+
+        def changed(new, old):
+            if old is None:
+                return True
+            if (new == 0) != (old == 0):     # on/off transitions always matter
+                return True
+            return abs(new - old) >= self.zendure_deadband
+
+        if changed(input_limit, last_in):
+            if self.zendure.set_input_limit(input_limit):
+                last_in = input_limit
+        if changed(output_limit, last_out):
+            if self.zendure.set_output_limit(output_limit):
+                last_out = output_limit
+        self._battery_setpoint = (last_in, last_out)
+
+    def restore_battery_defaults(self):
+        """Hand the battery back a usable state on shutdown.
+
+        If the controller stops while it has parked inputLimit at 0, nothing
+        would ever raise it again and the battery would sit idle forever.
+        """
+        if not (self.zendure_control and self.zendure):
+            return
+        self.zendure.set_input_limit(self.zendure_max_charge)
+        self.zendure.set_output_limit(0)
+        logger.info("Zendure limits restored to charge=%sW, discharge=0W",
+                    self.zendure_max_charge)
 
     def _is_night(self):
         """Check if current time is within night charging window."""
@@ -469,6 +563,8 @@ class SurplusController:
                     "bat_soc": status.get("bat_soc", ""),
                     "bat_charge": status.get("bat_charge", ""),
                     "bat_discharge": status.get("bat_discharge", ""),
+                    "bat_in_limit": status.get("bat_input_limit", ""),
+                    "bat_out_limit": status.get("bat_output_limit", ""),
                 }
                 writer.writerow(row)
         except OSError as e:
@@ -566,6 +662,14 @@ class SurplusController:
         # to the uncorrected surplus, i.e. exactly the behaviour without it.
         self.battery_status = self.zendure.get_status() if self.zendure else None
         usable_surplus = self._corrected_surplus(surplus)
+
+        # Battery control runs on every cycle, whatever the car branch below
+        # decides -- the battery still needs regulating when no car is plugged
+        # in. Skipped when Fronius is unreadable, since grid_power would be a
+        # fabricated zero.
+        if power_flow is not None:
+            self._control_battery(grid_power,
+                                  charger_status.get("charging_power") or 0)
 
         # No car connected -- log solar data and idle
         if charger_status["car"] == 1:

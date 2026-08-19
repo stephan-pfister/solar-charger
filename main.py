@@ -140,6 +140,7 @@ def main():
         nonlocal running
         logger.info("Shutting down — stopping charger...")
         charger.stop_charging()
+        controller.restore_battery_defaults()
         running = False
 
     signal.signal(signal.SIGINT, shutdown)

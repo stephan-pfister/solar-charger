@@ -456,6 +456,7 @@ function batteryLabel(d) {
   var flow = '';
   if (d.bat_charge > 0)         flow = ' \u2191 ' + Math.round(d.bat_charge) + ' W';
   else if (d.bat_discharge > 0) flow = ' \u2193 ' + Math.round(d.bat_discharge) + ' W';
+  else if (d.bat_input_limit === 0 && d.bat_output_limit === 0) flow = ' paused';
   else                          flow = ' idle';
   return d.bat_soc + ' %' + flow;
 }

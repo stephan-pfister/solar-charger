@@ -12,7 +12,8 @@ Connects a **Fronius Symo** inverter to a **go-eCharger** (API v2) to automatica
 - **mDNS discovery** — auto-finds devices on your network
 - **Hysteresis** — waits 30s before stopping (handles passing clouds)
 - **House battery aware** — reads a Zendure SolarFlow so its discharge is not
-  mistaken for solar surplus, and a
+  mistaken for solar surplus, and optionally drives its charge/discharge limits
+  so the car is served before the battery, and a
   dwell time + power margin before switching phases (avoids contactor flapping)
 - **Closed-loop current** — measures what the car actually draws and compensates,
   instead of assuming `amps x voltage x phases`
@@ -223,14 +224,49 @@ The battery is a sensor, never a prerequisite. If it cannot be reached the
 controller falls back to the uncorrected surplus, and the read uses a 2s
 timeout so it cannot stall the 10s control loop.
 
-### Writing to the device
+### Battery control (`zendure_control`)
 
-`ZendureClient.set_input_limit()` exists but is not used by the control loop
-yet. On a device with HEMS enabled in the Zendure app, writes are accepted and
-then **reverted after about 5 seconds** by the app's own regulation — verified
-on firmware message schema v3. Commanding the battery therefore requires
-disabling HEMS in the app first, which also means the controller takes over
-responsibility for charging the battery.
+With HEMS **enabled** in the Zendure app, writes are accepted and then
+**reverted after about 5 seconds** by the app's own regulation — verified on
+firmware message schema v3. Controlling the battery therefore requires turning
+HEMS off in the app.
+
+> **HEMS off without `zendure_control: true` is worse than HEMS on.** Nothing
+> regulates the battery then: it charges at its fixed `inputLimit` whether or
+> not the sun is shining, and `outputLimit` stays wherever it was — in our case
+> `0`, meaning the battery could charge but never give the energy back.
+
+With `zendure_control: true` the controller drives both limits every cycle so
+the utility meter sits near zero:
+
+```
+neutral_grid = grid_power + car_power - battery_charge + battery_discharge
+```
+
+Two corrections make that number meaningful. The charger is **not** behind the
+Fronius meter, so its measured draw has to be added by hand. The battery **is**
+behind the meter, so its own charge/discharge is already inside `grid_power` and
+has to be backed out — otherwise the loop chases its own tail, reading "charging
+at 1200W while importing 300W" as a reason to discharge when there is in fact
+900W of spare export.
+
+From that: spare export (minus `zendure_reserve_watts`) becomes the charge
+limit, a deficit becomes the discharge limit, and the car is served first
+because its draw is subtracted before the battery gets anything.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `zendure_control` | `false` | Master switch. Requires HEMS off. |
+| `zendure_max_charge_watts` | `1200` | Cap for `inputLimit` |
+| `zendure_max_discharge_watts` | `800` | Cap for `outputLimit` |
+| `zendure_min_soc_percent` | `10` | Stop discharging at or below this |
+| `zendure_reserve_watts` | `200` | Export kept as margin |
+| `zendure_deadband_watts` | `75` | Ignore smaller changes (avoids write spam) |
+
+Setpoints are only written when they actually move — crossing to or from zero
+always writes. On shutdown the controller restores `inputLimit` to the
+configured maximum, so a stopped container never leaves the battery parked at
+zero forever.
 
 ## License
 

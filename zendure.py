@@ -102,11 +102,23 @@ class ZendureClient:
         Used to hand solar surplus to the car first: setting this to 0 pauses
         battery charging without touching any other setting.
         """
+        return self._write_property("inputLimit", watts)
+
+    def set_output_limit(self, watts):
+        """Set the discharge power limit. Returns True on success.
+
+        With the app's HEMS enabled the device maintains this itself. With HEMS
+        off nothing does, and a limit of 0 means the battery can charge but can
+        never give the energy back -- so the controller has to drive it.
+        """
+        return self._write_property("outputLimit", watts)
+
+    def _write_property(self, name, watts):
         serial = self.serial
         if not serial:
             logger.error("Zendure write needs a serial number")
             return False
-        return self._write({"inputLimit": int(watts)}, serial)
+        return self._write({name: max(0, int(watts))}, serial)
 
     def _write(self, properties, serial):
         payload = {"sn": serial, "properties": properties}

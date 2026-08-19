@@ -5,6 +5,7 @@ Run with:  python3 -m unittest -v
 
 import csv
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -343,3 +344,149 @@ class CsvHeaderMigration(unittest.TestCase):
         self.assertIn(path, c._migrated_logs)
         with open(path, newline="") as f:
             self.assertEqual(len(list(csv.DictReader(f))), 2)
+
+
+class RecordingZendure:
+    """Records writes so tests can assert on the setpoints, not the traffic."""
+
+    def __init__(self, soc=50, charge=0, discharge=0, in_limit=1200, out_limit=0):
+        self.state = {"soc": soc, "charge_power": charge,
+                      "discharge_power": discharge, "solar_power": 0,
+                      "home_power": 0, "grid_input_power": charge,
+                      "input_limit": in_limit, "output_limit": out_limit,
+                      "pack_count": 1, "serial": "TESTSN"}
+        self.input_writes = []
+        self.output_writes = []
+
+    def get_status(self):
+        return dict(self.state)
+
+    def set_input_limit(self, w):
+        self.input_writes.append(w)
+        return True
+
+    def set_output_limit(self, w):
+        self.output_writes.append(w)
+        return True
+
+
+class BatteryControlTest(unittest.TestCase):
+    """The battery loop, driven the way the real cycle drives it."""
+
+    def _controller(self, zendure, **overrides):
+        cfg = {"zendure_control": True, "zendure_max_charge_watts": 1200,
+               "zendure_max_discharge_watts": 800, "zendure_min_soc_percent": 10,
+               "zendure_reserve_watts": 200, "zendure_deadband_watts": 75,
+               "log_dir": self.tmp}
+        cfg.update(overrides)
+        c = C.SurplusController(cfg, object(), object(), zendure=zendure)
+        c.battery_status = zendure.get_status()
+        return c
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_charges_from_spare_export(self):
+        z = RecordingZendure(charge=0)
+        c = self._controller(z)
+        c._control_battery(grid_power=-5000, car_power=0)
+        # 5000W export minus the 200W reserve, clamped to the 1200W max
+        self.assertEqual(z.input_writes, [1200])
+        self.assertEqual(z.output_writes, [0])
+
+    def test_own_charging_is_backed_out_before_deciding(self):
+        """Importing 300W *while* charging 1200W still means spare export.
+
+        Without backing the battery's own draw out of the meter reading the
+        loop would read this as a reason to discharge.
+        """
+        z = RecordingZendure(charge=1200)
+        c = self._controller(z)
+        c._control_battery(grid_power=300, car_power=0)
+        # neutral grid = 300 - 1200 = -900 export -> 900 - 200 reserve = 700
+        self.assertEqual(z.input_writes, [700])
+        self.assertEqual(z.output_writes, [0])
+
+    def test_car_has_priority_over_battery(self):
+        z = RecordingZendure(charge=0)
+        c = self._controller(z)
+        # 5000W export on the Fronius, but the (unmetered) car already takes 4500
+        c._control_battery(grid_power=-5000, car_power=4500)
+        self.assertEqual(z.input_writes, [300])
+
+    def test_car_using_everything_pauses_the_battery(self):
+        z = RecordingZendure(charge=600)
+        c = self._controller(z)
+        c._control_battery(grid_power=-600, car_power=1200)
+        self.assertEqual(z.input_writes, [0])
+
+    def test_discharges_to_cover_house_at_night(self):
+        z = RecordingZendure(charge=0, discharge=0, in_limit=1200)
+        c = self._controller(z)
+        c._control_battery(grid_power=700, car_power=0)
+        self.assertEqual(z.input_writes, [0])
+        self.assertEqual(z.output_writes, [700])
+
+    def test_no_grid_charging_at_night(self):
+        """The failure mode that HEMS-off created: charging with no sun."""
+        z = RecordingZendure(charge=1200, in_limit=1200)
+        c = self._controller(z)
+        # Importing 1400W of which 1200W is the battery itself -> 200W real load
+        c._control_battery(grid_power=1400, car_power=0)
+        self.assertEqual(z.input_writes, [0])
+        self.assertEqual(z.output_writes, [200])
+
+    def test_discharge_stops_at_min_soc(self):
+        z = RecordingZendure(soc=10, charge=0)
+        c = self._controller(z)
+        c._control_battery(grid_power=700, car_power=0)
+        self.assertEqual(z.output_writes, [0])
+
+    def test_discharge_is_capped(self):
+        z = RecordingZendure(charge=0)
+        c = self._controller(z)
+        c._control_battery(grid_power=3000, car_power=0)
+        self.assertEqual(z.output_writes, [800])
+
+    def test_small_changes_do_not_rewrite(self):
+        z = RecordingZendure(charge=0)
+        c = self._controller(z)
+        c._control_battery(grid_power=-1000, car_power=0)   # -> 800
+        z.state["charge_power"] = 800
+        c.battery_status = z.get_status()
+        c._control_battery(grid_power=-230, car_power=0)    # -> 830, +30
+        self.assertEqual(z.input_writes, [800], "30W drift must not rewrite")
+
+    def test_crossing_zero_always_writes(self):
+        z = RecordingZendure(charge=0)
+        c = self._controller(z)
+        c._control_battery(grid_power=-1000, car_power=0)   # -> 800
+        z.state["charge_power"] = 800
+        c.battery_status = z.get_status()
+        c._control_battery(grid_power=800, car_power=0)     # neutral 0 -> pause
+        self.assertEqual(z.input_writes, [800, 0])
+
+    def test_disabled_flag_writes_nothing(self):
+        z = RecordingZendure(charge=1200)
+        c = self._controller(z, zendure_control=False)
+        c._control_battery(grid_power=-5000, car_power=0)
+        self.assertEqual(z.input_writes, [])
+        self.assertEqual(z.output_writes, [])
+
+    def test_unreachable_battery_writes_nothing(self):
+        z = RecordingZendure()
+        c = self._controller(z)
+        c.battery_status = None
+        c._control_battery(grid_power=-5000, car_power=0)
+        self.assertEqual(z.input_writes, [])
+
+    def test_shutdown_restores_a_usable_state(self):
+        z = RecordingZendure(charge=0)
+        c = self._controller(z)
+        c._control_battery(grid_power=800, car_power=0)     # parks input at 0
+        c.restore_battery_defaults()
+        self.assertEqual(z.input_writes[-1], 1200,
+                         "a stuck inputLimit=0 would never charge again")
