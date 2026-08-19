@@ -254,6 +254,13 @@ From that: spare export (minus `zendure_reserve_watts`) becomes the charge
 limit, a deficit becomes the discharge limit, and the car is served first
 because its draw is subtracted before the battery gets anything.
 
+**`acMode` gates the direction, not the limit.** Measured on the device: with
+`acMode: 1` (charge) an `outputLimit` of 300W was accepted and echoed back, but
+`packInputPower` and `outputHomePower` stayed at 0 — the battery simply did not
+discharge. Setting `acMode: 2` with the same limit produced 298W within one
+poll. The controller therefore writes the mode before the limits, and leaves the
+mode alone when neither side wants power so an idle battery does not flap.
+
 | Key | Default | Meaning |
 |---|---|---|
 | `zendure_control` | `false` | Master switch. Requires HEMS off. |

@@ -113,6 +113,24 @@ class ZendureClient:
         """
         return self._write_property("outputLimit", watts)
 
+    def set_ac_mode(self, mode):
+        """Switch the AC direction. 1 = charge, 2 = discharge.
+
+        Measured on a SolarFlow 1600 AC+: with acMode=1 a non-zero outputLimit
+        is accepted and reported back, but the battery does not discharge --
+        packInputPower and outputHomePower stay at 0. Setting acMode=2 with the
+        same limit produced 298W within one poll. The mode, not the limit, is
+        what actually opens the discharge path.
+        """
+        if mode not in (1, 2):
+            logger.error(f"Invalid Zendure acMode: {mode}")
+            return False
+        serial = self.serial
+        if not serial:
+            logger.error("Zendure write needs a serial number")
+            return False
+        return self._write({"acMode": int(mode)}, serial)
+
     def _write_property(self, name, watts):
         serial = self.serial
         if not serial:

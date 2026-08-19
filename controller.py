@@ -188,6 +188,7 @@ class SurplusController:
         self.zendure_reserve = config.get("zendure_reserve_watts", 200)
         self.zendure_deadband = config.get("zendure_deadband_watts", 75)
         self._battery_setpoint = (None, None)   # (input_limit, output_limit)
+        self._battery_ac_mode = None            # 1 = charge, 2 = discharge
 
         # Closed-loop correction: the car draws less than the pilot limit we
         # set, so compensate instead of assuming amps * voltage * phases.
@@ -301,13 +302,25 @@ class SurplusController:
             else:
                 target_out = int(min(max(neutral_grid, 0), self.zendure_max_discharge))
 
-        self._apply_battery_limits(target_in, target_out)
+        # acMode gates the direction: a discharge limit is silently ignored
+        # while the device is in charge mode. Keep the current mode when
+        # neither side wants power, so an idle battery does not flap.
+        if target_in > 0:
+            target_mode = 1
+        elif target_out > 0:
+            target_mode = 2
+        else:
+            target_mode = self._battery_ac_mode
 
-    def _apply_battery_limits(self, input_limit, output_limit):
-        """Write limits, but only when they actually moved.
+        self._apply_battery_limits(target_in, target_out, target_mode)
+
+    def _apply_battery_limits(self, input_limit, output_limit, ac_mode=None):
+        """Write mode and limits, but only when they actually moved.
 
         Same reasoning as for the charger: a setpoint resent every 10s is
-        thousands of pointless writes a day.
+        thousands of pointless writes a day. The mode is written before the
+        limits so the device is already facing the right direction when the
+        new limit lands.
         """
         last_in, last_out = self._battery_setpoint
 
@@ -317,6 +330,10 @@ class SurplusController:
             if (new == 0) != (old == 0):     # on/off transitions always matter
                 return True
             return abs(new - old) >= self.zendure_deadband
+
+        if ac_mode is not None and ac_mode != self._battery_ac_mode:
+            if self.zendure.set_ac_mode(ac_mode):
+                self._battery_ac_mode = ac_mode
 
         if changed(input_limit, last_in):
             if self.zendure.set_input_limit(input_limit):
@@ -334,6 +351,7 @@ class SurplusController:
         """
         if not (self.zendure_control and self.zendure):
             return
+        self.zendure.set_ac_mode(1)
         self.zendure.set_input_limit(self.zendure_max_charge)
         self.zendure.set_output_limit(0)
         logger.info("Zendure limits restored to charge=%sW, discharge=0W",

@@ -357,6 +357,7 @@ class RecordingZendure:
                       "pack_count": 1, "serial": "TESTSN"}
         self.input_writes = []
         self.output_writes = []
+        self.mode_writes = []
 
     def get_status(self):
         return dict(self.state)
@@ -367,6 +368,10 @@ class RecordingZendure:
 
     def set_output_limit(self, w):
         self.output_writes.append(w)
+        return True
+
+    def set_ac_mode(self, m):
+        self.mode_writes.append(m)
         return True
 
 
@@ -490,3 +495,66 @@ class BatteryControlTest(unittest.TestCase):
         c.restore_battery_defaults()
         self.assertEqual(z.input_writes[-1], 1200,
                          "a stuck inputLimit=0 would never charge again")
+
+
+class BatteryAcModeTest(unittest.TestCase):
+    """acMode gates the direction; a discharge limit alone does nothing.
+
+    Measured on the real device: with acMode=1 an outputLimit of 300W was
+    accepted and echoed back, but packInputPower stayed at 0. Only acMode=2
+    actually moved power.
+    """
+
+    _controller = BatteryControlTest._controller
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_charging_selects_charge_mode(self):
+        z = RecordingZendure(charge=0)
+        c = self._controller(z)
+        c._control_battery(grid_power=-5000, car_power=0)
+        self.assertEqual(z.mode_writes, [1])
+
+    def test_discharging_selects_discharge_mode(self):
+        z = RecordingZendure(charge=0)
+        c = self._controller(z)
+        c._control_battery(grid_power=700, car_power=0)
+        self.assertEqual(z.mode_writes, [2])
+
+    def test_mode_is_not_rewritten_while_unchanged(self):
+        z = RecordingZendure(charge=0)
+        c = self._controller(z)
+        c._control_battery(grid_power=-5000, car_power=0)
+        z.state["charge_power"] = 1200
+        c.battery_status = z.get_status()
+        c._control_battery(grid_power=-5000, car_power=0)
+        self.assertEqual(z.mode_writes, [1], "mode must be written once, not per cycle")
+
+    def test_idle_keeps_the_current_mode(self):
+        """Neither side wants power: do not flap the direction."""
+        z = RecordingZendure(soc=5, charge=0)
+        c = self._controller(z)
+        c._control_battery(grid_power=700, car_power=0)   # below min SoC -> no discharge
+        self.assertEqual(z.mode_writes, [], "idle battery must not switch mode")
+
+    def test_switching_from_charge_to_discharge(self):
+        z = RecordingZendure(charge=1200)
+        c = self._controller(z)
+        c._control_battery(grid_power=-5000, car_power=0)     # charge
+        z.state["charge_power"] = 1200
+        c.battery_status = z.get_status()
+        c._control_battery(grid_power=1400, car_power=0)      # sun gone
+        self.assertEqual(z.mode_writes, [1, 2])
+        self.assertEqual(z.input_writes[-1], 0)
+
+    def test_shutdown_returns_the_device_to_charge_mode(self):
+        z = RecordingZendure(charge=0)
+        c = self._controller(z)
+        c._control_battery(grid_power=700, car_power=0)   # leaves it in discharge
+        c.restore_battery_defaults()
+        self.assertEqual(z.mode_writes[-1], 1)
+        self.assertEqual(z.input_writes[-1], 1200)
